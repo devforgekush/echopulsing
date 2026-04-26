@@ -1,42 +1,47 @@
-# EchoPulsing Music
+# EchoPulsing Music Bot
 
-EchoPulsing Music is a Telegram group voice-chat music bot with low-latency URL streaming.
-It uses yt-dlp direct stream extraction, FFmpeg, PyTgCalls, and MongoDB playlists.
+Fast Telegram voice chat music bot focused on low-latency streaming and clean playback control.
 
 ## Features
-- Fast streaming pipeline: yt-dlp URL extraction -> FFmpeg -> PyTgCalls
-- Per-chat async queue with race-safe playback locks
-- Inline controls with callback actions:
-  - play/pause toggle
-  - skip
-  - loop modes (`off`, `single`, `all`)
-  - shuffle
-- Prefetch (zero-gap playback): resolves next track while current track is playing
-- Queue commands and playlist persistence
-- Cookie fallback for restricted media (`YTDLP_COOKIES_FILE`)
+- ⚡ Fast streaming with yt-dlp direct URLs (no full media download)
+- 🎧 Voice chat playback powered by PyTgCalls
+- 📜 Smart per-chat queue system
+- 🔁 Loop modes: off, single, all
+- 🔀 Shuffle support
+- ⏩ `/playforce` for instant track override
+- ⚡ Prefetch for near zero-gap transitions
+- 🎛️ Inline controls: pause/resume, skip, loop, shuffle
+- 🔐 Admin + owner authorization controls
+- ♻️ Secure `/restart` command
 
-## Requirements
-- Python 3.11+
-- FFmpeg available in PATH (or set `FFMPEG_LOCATION`)
-- MongoDB
-- Telegram API credentials and a user string session
+## Commands
+- `/play <query or url>`
+- `/playforce <query or url>`
+- `/skip`
+- `/pause`
+- `/resume`
+- `/stop`
+- `/queue`
+- `/loop off|single|all`
+- `/volume <10-200>`
+- `/restart`
 
-## Setup
-1. Clone repository.
-2. Create env file from example:
-
-```bash
-cp .env.example .env
-```
-
-3. Install dependencies:
+## Installation
+1. Clone the repository.
+2. Install dependencies:
 
 ```bash
 python -m pip install -r requirements.txt
 ```
 
+3. Create your environment file from the template:
+
+```bash
+cp .env.example .env
+```
+
 4. Fill `.env` values.
-5. Run:
+5. Run the bot:
 
 ```bash
 python -m echopulsing.main
@@ -44,49 +49,31 @@ python -m echopulsing.main
 
 ## Environment Variables
 Required:
-- `API_ID`
-- `API_HASH`
-- `BOT_TOKEN`
-- `STRING_SESSION`
-- `MONGO_URI`
+- `API_ID` - Telegram API ID
+- `API_HASH` - Telegram API hash
+- `BOT_TOKEN` - Telegram bot token from BotFather
+- `STRING_SESSION` - Assistant account session string
+- `OWNER_ID` - Bot owner Telegram user ID
 
 Optional:
-- `LOG_CHANNEL_ID`
-- `YTDLP_COOKIES_FILE` (path to cookies file)
-- `FFMPEG_LOCATION` (directory containing ffmpeg binary)
+- `ADMINS` - Comma-separated Telegram user IDs
+- `YTDLP_COOKIES_FILE` - Cookies file path for restricted videos
+- `MONGO_URI` - MongoDB connection string
+- `LOG_CHANNEL_ID` - Log channel ID
+- `FFMPEG_LOCATION` - Directory containing ffmpeg binary
 
-## Commands
-- `/play <query or url>`
-- `/pause`
-- `/resume`
-- `/skip`
-- `/stop`
-- `/queue`
-- `/current`
-- `/loop off|single|all`
-- `/volume <10-200>`
-- `/playlist_save <name>`
-- `/playlist_load <name>`
+## Deployment
+- VPS (recommended): best for stable voice playback and uptime
+- Docker (optional): quick containerized deployment with `docker compose`
+- Render (limited): works for bot process, but voice features can be restricted by environment/runtime constraints
 
-## Docker
+## Notes
+- Some videos require cookies; set `YTDLP_COOKIES_FILE` and keep the file private.
+- Voice playback backend is Linux-oriented; run on Linux host, Docker Linux container, VPS, or WSL.
 
-```bash
-docker compose up -d --build
-```
-
-## Deployment Options
-- VPS (Docker Compose)
-- Render (Docker service)
-
-## Security Notes
-- Never commit `.env`, session files, or `cookies.txt`.
-- Keep `STRING_SESSION` private.
-- Rotate credentials if leaked.
-
-## Architecture
-- `echopulsing/services`: runtime, voice, queue, yt-dlp, db
-- `echopulsing/handlers`: bot command and callback handlers
-- `echopulsing/utils`: UI, logger, helper utilities
+## Security
+- Never commit `.env`, session files, bot tokens, or `cookies.txt`.
+- Rotate credentials immediately if exposure is suspected.
 
 ## License
 See `LICENSE`.

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import html
+import os
+import sys
 import time
 from typing import TYPE_CHECKING
 
@@ -8,7 +10,7 @@ from pyrogram import Client, enums, filters
 from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from echopulsing.services.models import Track
-from echopulsing.utils.helpers import command_arg, format_seconds, is_admin
+from echopulsing.utils.helpers import command_arg, format_seconds, is_admin, is_authorized
 
 if TYPE_CHECKING:
     from echopulsing.services.runtime import Runtime
@@ -212,6 +214,33 @@ async def _safe_answer_query(query: CallbackQuery, text: str, *, show_alert: boo
 
 
 def register(app: Client, runtime: Runtime) -> None:
+    @app.on_message(filters.command(["restart"]))
+    async def restart_handler(client: Client, message: Message) -> None:
+        if not message.from_user:
+            await message.reply_text("❌ Not allowed")
+            return
+
+        user_id = message.from_user.id
+        allowed = is_authorized(user_id)
+        if not allowed and message.chat and message.chat.type in {enums.ChatType.GROUP, enums.ChatType.SUPERGROUP}:
+            try:
+                allowed = await is_admin(client, message.chat.id, user_id)
+            except Exception:
+                allowed = False
+
+        if not allowed:
+            await runtime.log_event(f"Unauthorized /restart by {user_id} in chat {message.chat.id}")
+            await message.reply_text("❌ Not allowed")
+            return
+
+        await runtime.log_event(f"Authorized /restart by {user_id} in chat {message.chat.id}")
+        await message.reply_text("♻️ Restarting bot...")
+        try:
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+        except Exception as exc:
+            await runtime.log_event(f"/restart failed in chat {message.chat.id}: {exc}")
+            await message.reply_text("❌ Restart failed")
+
     @app.on_message(filters.command(["play"]) & filters.group)
     async def play_handler(client: Client, message: Message) -> None:
         if not runtime.voice_available:
