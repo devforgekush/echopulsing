@@ -222,7 +222,13 @@ def register(app: Client, runtime: Runtime) -> None:
 
         user_id = message.from_user.id
         allowed = is_authorized(user_id)
-        if not allowed and message.chat and message.chat.type in {enums.ChatType.GROUP, enums.ChatType.SUPERGROUP}:
+        allow_group_admin_restart = os.getenv("ALLOW_GROUP_ADMIN_RESTART", "").strip().lower() == "true"
+        if (
+            not allowed
+            and allow_group_admin_restart
+            and message.chat
+            and message.chat.type in {enums.ChatType.GROUP, enums.ChatType.SUPERGROUP}
+        ):
             try:
                 allowed = await is_admin(client, message.chat.id, user_id)
             except Exception:

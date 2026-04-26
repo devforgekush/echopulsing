@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import heapq
 import os
 import shutil
 import time
@@ -15,6 +16,8 @@ from echopulsing.services.models import Track
 
 class YtDlpService:
     _CACHE_TTL_SECONDS = 30 * 60
+    _MAX_CACHE_SIZE = 500
+    _PRUNE_BATCH_SIZE = 50
     _EXTRACT_RETRIES = 3
 
     def __init__(
@@ -80,6 +83,33 @@ class YtDlpService:
         created_at = time.monotonic()
         for key in self._cache_keys(query_or_url, payload):
             self._track_cache[key] = (created_at, dict(payload))
+        self._prune_cache()
+
+    def _prune_cache(self) -> None:
+        if len(self._track_cache) <= self._MAX_CACHE_SIZE:
+            return
+
+        now = time.monotonic()
+        expired_keys = [
+            key
+            for key, (created_at, _) in self._track_cache.items()
+            if (now - created_at) > self._CACHE_TTL_SECONDS
+        ]
+        for key in expired_keys:
+            self._track_cache.pop(key, None)
+
+        if len(self._track_cache) <= self._MAX_CACHE_SIZE:
+            return
+
+        overflow = len(self._track_cache) - self._MAX_CACHE_SIZE
+        trim_count = max(overflow, self._PRUNE_BATCH_SIZE)
+        oldest_items = heapq.nsmallest(
+            trim_count,
+            self._track_cache.items(),
+            key=lambda item: item[1][0],
+        )
+        for key, _ in oldest_items:
+            self._track_cache.pop(key, None)
 
     @staticmethod
     def _is_direct_stream_url(value: str | None) -> bool:

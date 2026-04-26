@@ -174,7 +174,14 @@ class VoiceService:
                 if not await self._is_connected(chat_id):
                     await self._reset_state(chat_id, "stream_end while disconnected", keep_queue=True)
                     return
-                await self.play_next(chat_id, notify_ui=True)
+                try:
+                    await self.play_next(chat_id, notify_ui=True)
+                except Exception as exc:
+                    self.logger.exception(
+                        "Auto transition failed after stream_end in chat %s: %s",
+                        chat_id,
+                        exc,
+                    )
         except Exception as exc:  # pragma: no cover
             self.logger.warning("Unable to register stream-end handler: %s", exc)
 

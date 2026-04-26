@@ -38,7 +38,18 @@ class PlaybackService:
         )
         prewarm_task = asyncio.create_task(self._voice.prewarm_connection(chat_id))
 
-        track = await resolve_task
+        try:
+            track = await resolve_task
+        except Exception:
+            if not prewarm_task.done():
+                prewarm_task.cancel()
+            try:
+                await prewarm_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+            raise
         resolve_ms = int((time.perf_counter() - started_at) * 1000)
 
         prewarm_error: Exception | None = None
