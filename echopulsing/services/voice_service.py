@@ -25,13 +25,71 @@ class VoiceService:
         self.queue = queue
         self.ytdlp = ytdlp
         self.logger = logger
-        self._lock = asyncio.Lock()
         self._started_at: dict[int, float] = {}
         self._paused_at: dict[int, float] = {}
         self._paused_total: dict[int, float] = {}
         self._active_chats: set[int] = set()
+        self._chat_locks: dict[int, asyncio.Lock] = {}
+        self._prefetch_cache: dict[int, Track] = {}
+        self._prefetch_tasks: dict[int, asyncio.Task[None]] = {}
         self._auto_transition_callback: Callable[[int, Track | None], Awaitable[None]] | None = None
         self._register_stream_end_handler()
+
+    @staticmethod
+    def _track_signature(track: Track | None) -> str:
+        if track is None:
+            return ""
+        return f"{track.id or ''}:{track.webpage_url}:{track.created_at}"
+
+    async def invalidate_prefetch(self, chat_id: int) -> None:
+        self._prefetch_cache.pop(chat_id, None)
+        task = self._prefetch_tasks.pop(chat_id, None)
+        if task and not task.done():
+            task.cancel()
+
+    def _schedule_prefetch(self, chat_id: int) -> None:
+        task = self._prefetch_tasks.get(chat_id)
+        if task and not task.done():
+            return
+        self._prefetch_tasks[chat_id] = asyncio.create_task(self._prefetch_next(chat_id))
+
+    async def _prefetch_next(self, chat_id: int) -> None:
+        try:
+            async with self._chat_lock(chat_id):
+                next_track = await self.queue.peek_next(chat_id)
+                if not next_track:
+                    self._prefetch_cache.pop(chat_id, None)
+                    return
+
+                next_signature = self._track_signature(next_track)
+                cached = self._prefetch_cache.get(chat_id)
+                if cached and self._track_signature(cached) == next_signature and cached.stream_url:
+                    return
+
+            if next_track.stream_url:
+                resolved = next_track
+            else:
+                resolved = await self.ytdlp.ensure_stream_url(next_track)
+
+            if not resolved.stream_url:
+                return
+
+            async with self._chat_lock(chat_id):
+                still_next = await self.queue.peek_next(chat_id)
+                if not still_next:
+                    self._prefetch_cache.pop(chat_id, None)
+                    return
+                if self._track_signature(still_next) != next_signature:
+                    return
+                self._prefetch_cache[chat_id] = resolved
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            self.logger.debug("Prefetch failed in chat %s: %s", chat_id, exc)
+        finally:
+            task = self._prefetch_tasks.get(chat_id)
+            if task and task.done():
+                self._prefetch_tasks.pop(chat_id, None)
 
     def set_auto_transition_callback(
         self,
@@ -48,14 +106,14 @@ class VoiceService:
             self.logger.warning("Auto transition UI callback failed in chat %s: %s", chat_id, exc)
 
     async def _safe_cleanup(self, track: Track | None) -> None:
-        if not track:
-            return
-        for _ in range(5):
-            try:
-                await self.ytdlp.cleanup_track_file(track)
-                return
-            except Exception:
-                await asyncio.sleep(0.4)
+        return
+
+    def _chat_lock(self, chat_id: int) -> asyncio.Lock:
+        lock = self._chat_locks.get(chat_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._chat_locks[chat_id] = lock
+        return lock
 
     async def _group_call_is_active(self, chat_id: int) -> bool:
         try:
@@ -84,24 +142,19 @@ class VoiceService:
 
     @staticmethod
     def _stream_source(track: Track) -> str:
-        return track.stream_url or track.file_path or track.webpage_url
+        if track.stream_url:
+            return track.stream_url
+        raise ValueError("Track is missing a direct stream URL")
 
     @staticmethod
     def _ffmpeg_parameters() -> str:
-        return "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -vn -loglevel error"
+        return (
+            "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 2 "
+            "-fflags nobuffer -flags low_delay -vn -loglevel error"
+        )
 
     def _build_media_stream(self, track: Track) -> MediaStream:
-        source = self._stream_source(track)
-        if track.stream_url:
-            return MediaStream(
-                source,
-                ffmpeg_parameters=self._ffmpeg_parameters(),
-            )
-        return MediaStream(
-            source,
-            ffmpeg_parameters=self._ffmpeg_parameters(),
-            ytdlp_parameters="--no-playlist --quiet --format bestaudio/best --geo-bypass --nocheckcertificate",
-        )
+        return MediaStream(self._stream_source(track), ffmpeg_parameters=self._ffmpeg_parameters())
 
     def _register_stream_end_handler(self) -> None:
         try:
@@ -125,7 +178,14 @@ class VoiceService:
         except Exception as exc:  # pragma: no cover
             self.logger.warning("Unable to register stream-end handler: %s", exc)
 
-    async def _start_stream(self, chat_id: int, track: Track, retry: int = 2) -> None:
+    async def prewarm_connection(self, chat_id: int) -> None:
+        # Keep state consistent while yt-dlp resolution runs in parallel.
+        connected = await self._is_connected(chat_id)
+        current = await self.queue.get_current(chat_id)
+        if current and not connected:
+            await self._reset_state(chat_id, "stale state found during prewarm", keep_queue=True)
+
+    async def _start_stream(self, chat_id: int, track: Track, retry: int = 1) -> None:
         was_connected = await self._is_connected(chat_id)
 
         stream = self._build_media_stream(track)
@@ -138,24 +198,6 @@ class VoiceService:
                     self._stream_source(track),
                 )
                 await self.calls.play(chat_id, stream)
-                joined = False
-                for _ in range(6):
-                    active_group_calls = await self.calls.group_calls
-                    if chat_id in active_group_calls:
-                        joined = True
-                        break
-                    await asyncio.sleep(0.5)
-
-                if not joined:
-                    active_group_calls = await self.calls.group_calls
-                    self.logger.warning(
-                        "Join not confirmed for chat %s. Active group calls: %s",
-                        chat_id,
-                        list(active_group_calls.keys()),
-                    )
-                    raise RuntimeError(
-                        "Voice chat join was not confirmed. Ensure the session account can join/speak in this call."
-                    )
 
                 self._started_at[chat_id] = time.monotonic()
                 self._paused_total[chat_id] = 0.0
@@ -180,75 +222,121 @@ class VoiceService:
                 if attempt >= retry:
                     await self._reset_state(chat_id, "stream start retries exhausted", keep_queue=True)
                     raise exc
-                await asyncio.sleep(1.2 * (attempt + 1))
+                await asyncio.sleep(0.35 * (attempt + 1))
+
+    async def _play_next_locked(
+        self,
+        chat_id: int,
+        notify_ui: bool = False,
+        force_advance: bool = False,
+    ) -> Track | None:
+        previous = await self.queue.get_current(chat_id)
+        loop_mode = await self.queue.get_loop_mode(chat_id)
+
+        if previous and loop_mode == "single" and not force_advance:
+            track = previous
+        else:
+            if previous and loop_mode == "all":
+                await self.queue.enqueue(chat_id, previous)
+            if previous and loop_mode != "single":
+                await self._safe_cleanup(previous)
+            track = await self.queue.pop_next(chat_id)
+
+        cached = self._prefetch_cache.get(chat_id)
+        if cached and track and self._track_signature(cached) == self._track_signature(track):
+            track = cached
+            self._prefetch_cache.pop(chat_id, None)
+
+        if not track:
+            await self._reset_state(chat_id, "queue empty", keep_queue=True)
+            try:
+                await self.calls.leave_call(chat_id)
+            except Exception:
+                pass
+            self.logger.info("Queue empty; left call in chat %s", chat_id)
+            if notify_ui:
+                await self._notify_auto_transition(chat_id, None)
+            return None
+
+        try:
+            if not track.stream_url:
+                track = await self.ytdlp.ensure_stream_url(track)
+            if not track.stream_url:
+                raise RuntimeError("Could not resolve a direct stream URL for playback")
+            await self._start_stream(chat_id, track)
+        except Exception:
+            if loop_mode != "single":
+                await self.queue.enqueue_front(chat_id, track)
+            raise
+
+        await self.queue.set_current(chat_id, track)
+        self.logger.info("Now playing in chat %s: %s", chat_id, track.title)
+        if notify_ui:
+            await self._notify_auto_transition(chat_id, track)
+        self._schedule_prefetch(chat_id)
+        return track
 
     async def play_next(self, chat_id: int, notify_ui: bool = False) -> Track | None:
-        async with self._lock:
-            previous = await self.queue.get_current(chat_id)
-            repeat = await self.queue.get_repeat(chat_id)
-
-            if previous and repeat:
-                track = previous
-            else:
-                if previous and not repeat:
-                    await self._safe_cleanup(previous)
-                track = await self.queue.pop_next(chat_id)
-
-            if not track:
-                await self._reset_state(chat_id, "queue empty", keep_queue=True)
-                try:
-                    await self.calls.leave_call(chat_id)
-                except Exception:
-                    pass
-                self.logger.info("Queue empty; left call in chat %s", chat_id)
-                if notify_ui:
-                    await self._notify_auto_transition(chat_id, None)
-                return None
-
-            try:
-                if not track.file_path:
-                    try:
-                        await self._start_stream(chat_id, track)
-                    except Exception:
-                        track = await self.ytdlp.download_audio(track)
-                        await self._start_stream(chat_id, track)
-                else:
-                    await self._start_stream(chat_id, track)
-            except Exception:
-                if not repeat:
-                    await self.queue.enqueue_front(chat_id, track)
-                raise
-
-            await self.queue.set_current(chat_id, track)
-            self.logger.info("Now playing in chat %s: %s", chat_id, track.title)
-            if notify_ui:
-                await self._notify_auto_transition(chat_id, track)
-            return track
+        async with self._chat_lock(chat_id):
+            return await self._play_next_locked(chat_id, notify_ui=notify_ui)
 
     async def enqueue_or_play(self, chat_id: int, track: Track) -> tuple[str, int]:
-        position = await self.queue.enqueue(chat_id, track)
-        current = await self.queue.get_current(chat_id)
-        connected = await self._is_connected(chat_id)
-        is_playing = bool(current and chat_id in self._active_chats)
+        async with self._chat_lock(chat_id):
+            position = await self.queue.enqueue(chat_id, track)
+            current = await self.queue.get_current(chat_id)
+            connected = await self._is_connected(chat_id)
+            is_playing = bool(current and chat_id in self._active_chats)
 
-        if not connected and current:
-            await self._reset_state(chat_id, "stale player state detected", keep_queue=True)
-            current = None
-            is_playing = False
+            if not connected and current:
+                await self._reset_state(chat_id, "stale player state detected", keep_queue=True)
+                current = None
+                is_playing = False
 
-        if is_playing and connected:
+            if is_playing and connected:
+                return "queued", position
+
+            started = await self._play_next_locked(chat_id)
+            if started:
+                self.logger.info("Playback restarted in chat %s", chat_id)
+                return "playing", 1
             return "queued", position
 
-        started = await self.play_next(chat_id)
-        if started:
-            self.logger.info("Playback restarted in chat %s", chat_id)
-            return "playing", 1
-        return "queued", position
+    async def force_play(self, chat_id: int, new_track: Track) -> Track | None:
+        async with self._chat_lock(chat_id):
+            current = await self.queue.get_current(chat_id)
+
+            await self.invalidate_prefetch(chat_id)
+
+            if current is not None:
+                await self.queue.enqueue_front(chat_id, current)
+
+            try:
+                await self.calls.leave_call(chat_id)
+            except Exception:
+                pass
+
+            await self._reset_state(chat_id, "force play", keep_queue=True)
+            await self.queue.enqueue_front(chat_id, new_track)
+
+            started = await self._play_next_locked(chat_id)
+            if started is not None:
+                self._schedule_prefetch(chat_id)
+            return started
 
     async def pause(self, chat_id: int) -> None:
         await self.calls.pause(chat_id)
         if chat_id in self._started_at and chat_id not in self._paused_at:
             self._paused_at[chat_id] = time.monotonic()
+
+    async def is_paused(self, chat_id: int) -> bool:
+        return chat_id in self._paused_at
+
+    async def toggle_pause(self, chat_id: int) -> bool:
+        if await self.is_paused(chat_id):
+            await self.resume(chat_id)
+            return False
+        await self.pause(chat_id)
+        return True
 
     async def resume(self, chat_id: int) -> None:
         await self.calls.resume(chat_id)
@@ -259,30 +347,34 @@ class VoiceService:
             )
 
     async def skip(self, chat_id: int) -> Track | None:
-        current = await self.queue.get_current(chat_id)
-        try:
-            await self.calls.leave_call(chat_id)
-        except Exception:
-            pass
+        async with self._chat_lock(chat_id):
+            await self.invalidate_prefetch(chat_id)
+            current = await self.queue.get_current(chat_id)
+            try:
+                await self.calls.leave_call(chat_id)
+            except Exception:
+                pass
 
-        await self._safe_cleanup(current)
-        await self._reset_state(chat_id, "skip requested", keep_queue=True)
-        return await self.play_next(chat_id)
+            await self._safe_cleanup(current)
+            await self._reset_state(chat_id, "skip requested", keep_queue=True)
+            return await self._play_next_locked(chat_id, force_advance=True)
 
     async def stop(self, chat_id: int) -> None:
-        current = await self.queue.get_current(chat_id)
-        queued = await self.queue.clear(chat_id)
+        async with self._chat_lock(chat_id):
+            await self.invalidate_prefetch(chat_id)
+            current = await self.queue.get_current(chat_id)
+            queued = await self.queue.clear(chat_id)
 
-        try:
-            await self.calls.leave_call(chat_id)
-        except Exception:
-            pass
+            try:
+                await self.calls.leave_call(chat_id)
+            except Exception:
+                pass
 
-        for item in queued:
-            await self._safe_cleanup(item)
-        await self._safe_cleanup(current)
+            for item in queued:
+                await self._safe_cleanup(item)
+            await self._safe_cleanup(current)
 
-        await self._reset_state(chat_id, "stop requested", keep_queue=False)
+            await self._reset_state(chat_id, "stop requested", keep_queue=False)
 
     async def set_volume(self, chat_id: int, volume: int) -> int:
         value = await self.queue.set_volume(chat_id, volume)

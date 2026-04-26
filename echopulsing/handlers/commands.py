@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-import asyncio
 import html
 import time
 from typing import TYPE_CHECKING
 
 from pyrogram import Client, enums, filters
-from pyrogram.types import CallbackQuery, Message
+from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from echopulsing.services.models import Track
 from echopulsing.utils.helpers import command_arg, format_seconds, is_admin
@@ -59,6 +58,131 @@ def _should_ignore_duplicate_play(chat_id: int, message_id: int) -> bool:
     return False
 
 
+def _assistant_missing_text(label: str, error: str | None = None) -> str:
+    lines = [
+        "⚠️ Assistant account is not in this group.",
+        "👉 Click below to add assistant, then press Retry.",
+        f"Assistant: {label}",
+    ]
+    if error:
+        lines.append(f"\nReason: {error}")
+    return "\n".join(lines)
+
+
+def _assistant_keyboard(invite_link: str | None, token: str) -> InlineKeyboardMarkup:
+    rows = []
+    if invite_link:
+        rows.append([InlineKeyboardButton("➕ Add Assistant", url=invite_link)])
+    rows.append([InlineKeyboardButton("🔁 Retry", callback_data=f"assistant_retry:{token}")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _execute_playback(
+    runtime: Runtime,
+    message: Message,
+    *,
+    query: str,
+    requester_id: int,
+    requester_name: str,
+) -> None:
+    status_message = await runtime.ui.loading_animation(message)
+    try:
+        result = await runtime.playback.play_query(
+            chat_id=message.chat.id,
+            query=query,
+            requester_id=requester_id,
+            requester_name=requester_name,
+        )
+
+        if result.state == "playing":
+            await runtime.ui.show_now_playing(message.chat.id, result.track)
+        else:
+            await message.reply_text(
+                f"🎶 Queued at position #{result.position}: {_escape(result.track.title)}",
+                parse_mode=enums.ParseMode.HTML,
+            )
+    except ValueError as exc:
+        if _is_no_results_error(exc):
+            await message.reply_text("⚠️ No results found")
+        else:
+            await message.reply_text("❌ Failed to play track")
+        await runtime.log_event(f"/play failed in {message.chat.id}: {exc}")
+    except Exception as exc:
+        await message.reply_text("❌ Failed to play track")
+        await runtime.log_event(f"/play failed in {message.chat.id}: {exc}")
+    finally:
+        if status_message is not None:
+            try:
+                await status_message.delete()
+            except Exception:
+                pass
+
+
+async def _execute_force_playback(
+    runtime: Runtime,
+    message: Message,
+    *,
+    query: str,
+    requester_id: int,
+    requester_name: str,
+) -> None:
+    status_message = await runtime.ui.loading_animation(message)
+    try:
+        track = await runtime.ytdlp.resolve(query, requester_id, requester_name)
+        started = await runtime.voice.force_play(message.chat.id, track)
+        if started is not None:
+            await runtime.ui.show_now_playing(message.chat.id, started)
+            await runtime.ui.refresh_now_playing(message.chat.id, force=True)
+            await message.reply_text(
+                f"⏩ Force playing: {_escape(started.title)}",
+                parse_mode=enums.ParseMode.HTML,
+            )
+            return
+        await message.reply_text("❌ Failed to start forced playback")
+    except ValueError as exc:
+        if _is_no_results_error(exc):
+            await message.reply_text("⚠️ No results found")
+        else:
+            await message.reply_text("❌ Failed to play track")
+        await runtime.log_event(f"/playforce failed in {message.chat.id}: {exc}")
+    except RuntimeError as exc:
+        await message.reply_text(str(exc))
+        await runtime.log_event(f"/playforce failed in {message.chat.id}: {exc}")
+    except Exception as exc:
+        await message.reply_text("❌ Failed to play track")
+        await runtime.log_event(f"/playforce failed in {message.chat.id}: {exc}")
+    finally:
+        if status_message is not None:
+            try:
+                await status_message.delete()
+            except Exception:
+                pass
+
+
+async def _prompt_assistant_join(
+    runtime: Runtime,
+    message: Message,
+    *,
+    query: str,
+    requester_id: int,
+    requester_name: str,
+    extra_error: str | None = None,
+) -> None:
+    invite_link, invite_error = await runtime.assistant.get_invite_link(message.chat.id)
+    reason = extra_error or invite_error
+    pending = runtime.assistant.create_pending_play(
+        chat_id=message.chat.id,
+        requester_id=requester_id,
+        requester_name=requester_name,
+        query=query,
+        invite_link=invite_link,
+    )
+    await message.reply_text(
+        _assistant_missing_text(runtime.assistant.assistant_label, reason),
+        reply_markup=_assistant_keyboard(invite_link, pending.token),
+    )
+
+
 async def _require_admin(client: Client, message: Message) -> bool:
     if not message.from_user:
         await message.reply_text("Only real user accounts can run this command.")
@@ -106,35 +230,118 @@ def register(app: Client, runtime: Runtime) -> None:
 
         requester_id = message.from_user.id if message.from_user else 0
         requester_name = _display_name(message)
-        resolve_task = asyncio.create_task(runtime.ytdlp.resolve(query, requester_id, requester_name))
-        status_message = await runtime.ui.loading_animation(message)
+        if not await runtime.assistant.is_in_chat(message.chat.id):
+            await _prompt_assistant_join(
+                runtime,
+                message,
+                query=query,
+                requester_id=requester_id,
+                requester_name=requester_name,
+            )
+            return
 
-        try:
-            track = await resolve_task
-            state, position = await runtime.voice.enqueue_or_play(message.chat.id, track)
+        await _execute_playback(
+            runtime,
+            message,
+            query=query,
+            requester_id=requester_id,
+            requester_name=requester_name,
+        )
 
-            if state == "playing":
-                await runtime.ui.show_now_playing(message.chat.id, track)
-            else:
-                await message.reply_text(
-                    f"🎶 Queued at position #{position}: {_escape(track.title)}",
-                    parse_mode=enums.ParseMode.HTML,
+    @app.on_message(filters.command(["playforce"]) & filters.group)
+    async def playforce_handler(client: Client, message: Message) -> None:
+        if not runtime.voice_available:
+            await message.reply_text(
+                "Voice backend is unavailable on this host. Run the bot in Linux (Docker/WSL/VPS)."
+            )
+            return
+
+        query = command_arg(message)
+        if not query:
+            await message.reply_text("Usage: /playforce <song name or YouTube URL>")
+            return
+
+        requester_id = message.from_user.id if message.from_user else 0
+        requester_name = _display_name(message)
+        if not await runtime.assistant.is_in_chat(message.chat.id):
+            await _prompt_assistant_join(
+                runtime,
+                message,
+                query=query,
+                requester_id=requester_id,
+                requester_name=requester_name,
+                extra_error="Assistant must join before /playforce can start audio.",
+            )
+            return
+
+        await _execute_force_playback(
+            runtime,
+            message,
+            query=query,
+            requester_id=requester_id,
+            requester_name=requester_name,
+        )
+
+    @app.on_callback_query(filters.regex(r"^assistant_retry:"))
+    async def assistant_retry_handler(client: Client, query: CallbackQuery) -> None:
+        if not query.message or not query.from_user:
+            await _safe_answer_query(query, "Play request not found.", show_alert=True)
+            return
+
+        token = (query.data or "").split(":", maxsplit=1)[-1]
+        pending = runtime.assistant.get_pending_play(token)
+        if not pending:
+            await _safe_answer_query(query, "Retry request expired. Run /play again.", show_alert=True)
+            return
+
+        if pending.chat_id != query.message.chat.id:
+            await _safe_answer_query(query, "This retry button belongs to another chat.", show_alert=True)
+            return
+
+        is_owner = query.from_user.id == pending.requester_id
+        is_chat_admin = await is_admin(client, pending.chat_id, query.from_user.id)
+        if not is_owner and not is_chat_admin:
+            await _safe_answer_query(query, "Only requester or admins can retry.", show_alert=True)
+            return
+
+        await _safe_answer_query(query, "Checking assistant...")
+
+        join_error: str | None = None
+        if not await runtime.assistant.is_in_chat(pending.chat_id):
+            if pending.invite_link:
+                _, join_error = await runtime.assistant.try_join_with_invite(
+                    pending.chat_id,
+                    pending.invite_link,
                 )
-        except ValueError as exc:
-            if _is_no_results_error(exc):
-                await message.reply_text("⚠️ No results found")
             else:
-                await message.reply_text("❌ Failed to play track")
-            await runtime.log_event(f"/play failed in {message.chat.id}: {exc}")
-        except Exception as exc:
-            await message.reply_text("❌ Failed to play track")
-            await runtime.log_event(f"/play failed in {message.chat.id}: {exc}")
-        finally:
-            if status_message is not None:
-                try:
-                    await status_message.delete()
-                except Exception:
-                    pass
+                join_error = "No invite link available for auto-join in this group."
+
+        if not await runtime.assistant.is_in_chat(pending.chat_id):
+            invite_link, invite_error = await runtime.assistant.get_invite_link(pending.chat_id)
+            refreshed = runtime.assistant.create_pending_play(
+                chat_id=pending.chat_id,
+                requester_id=pending.requester_id,
+                requester_name=pending.requester_name,
+                query=pending.query,
+                invite_link=invite_link,
+            )
+            reason = join_error or invite_error
+            await query.message.edit_text(
+                _assistant_missing_text(runtime.assistant.assistant_label, reason),
+                reply_markup=_assistant_keyboard(invite_link, refreshed.token),
+            )
+            runtime.assistant.clear_pending_play(token)
+            return
+
+        runtime.assistant.clear_pending_play(token)
+        await query.message.edit_text("✅ Assistant joined. Retrying playback...")
+        await _execute_playback(
+            runtime,
+            query.message,
+            query=pending.query,
+            requester_id=pending.requester_id,
+            requester_name=pending.requester_name,
+        )
 
     @app.on_message(filters.command(["pause", "hold"]) & filters.group)
     async def pause_handler(client: Client, message: Message) -> None:
@@ -248,15 +455,21 @@ def register(app: Client, runtime: Runtime) -> None:
             return
 
         arg = command_arg(message)
-        if not arg or arg.lower() not in {"on", "off"}:
-            enabled = await runtime.queue.get_repeat(message.chat.id)
-            await message.reply_text(f"Loop is {'on' if enabled else 'off'}. Use /loop on or /loop off")
+        if not arg:
+            mode = await runtime.queue.get_loop_mode(message.chat.id)
+            await message.reply_text("Loop mode: {}. Use /loop off|single|all".format(mode))
             return
 
-        enabled = arg.lower() == "on"
-        await runtime.queue.set_repeat(message.chat.id, enabled)
+        normalized = arg.lower()
+        if normalized == "on":
+            normalized = "single"
+        if normalized not in {"off", "single", "all"}:
+            await message.reply_text("Usage: /loop off|single|all")
+            return
+
+        mode = await runtime.queue.set_loop_mode(message.chat.id, normalized)
         await runtime.ui.refresh_now_playing(message.chat.id, force=True)
-        await message.reply_text(f"Loop is now {'on' if enabled else 'off'}.")
+        await message.reply_text(f"Loop mode is now {mode}.")
 
     @app.on_message(filters.command(["volume"]) & filters.group)
     async def volume_handler(client: Client, message: Message) -> None:
@@ -291,10 +504,10 @@ def register(app: Client, runtime: Runtime) -> None:
         action = (query.data or "").split(":", maxsplit=1)[-1]
 
         try:
-            if action == "pause":
-                await runtime.voice.pause(chat_id)
+            if action == "toggle":
+                paused = await runtime.voice.toggle_pause(chat_id)
                 await runtime.ui.refresh_now_playing(chat_id, force=True)
-                await _safe_answer_query(query, "Playback paused")
+                await _safe_answer_query(query, "Paused" if paused else "Playing")
             elif action == "skip":
                 next_track = await runtime.voice.skip(chat_id)
                 if next_track:
@@ -303,25 +516,18 @@ def register(app: Client, runtime: Runtime) -> None:
                 else:
                     await runtime.ui.clear_now_playing(chat_id)
                     await _safe_answer_query(query, "Queue is now empty")
-            elif action == "stop":
-                await runtime.voice.stop(chat_id)
-                await runtime.ui.clear_now_playing(chat_id)
-                await _safe_answer_query(query, "Playback stopped")
             elif action == "loop":
-                enabled = await runtime.queue.get_repeat(chat_id)
-                await runtime.queue.set_repeat(chat_id, not enabled)
+                mode = await runtime.queue.cycle_loop_mode(chat_id)
                 await runtime.ui.refresh_now_playing(chat_id, force=True)
-                await _safe_answer_query(query, f"Loop {'on' if not enabled else 'off'}")
-            elif action == "voldown":
-                current = await runtime.queue.get_volume(chat_id)
-                value = await runtime.voice.set_volume(chat_id, current - 10)
+                await _safe_answer_query(query, f"Loop mode: {mode}")
+            elif action == "shuffle":
+                count = await runtime.queue.shuffle(chat_id)
+                await runtime.voice.invalidate_prefetch(chat_id)
                 await runtime.ui.refresh_now_playing(chat_id, force=True)
-                await _safe_answer_query(query, f"Volume: {value}%")
-            elif action == "volup":
-                current = await runtime.queue.get_volume(chat_id)
-                value = await runtime.voice.set_volume(chat_id, current + 10)
-                await runtime.ui.refresh_now_playing(chat_id, force=True)
-                await _safe_answer_query(query, f"Volume: {value}%")
+                if count:
+                    await _safe_answer_query(query, f"Shuffled {count} queued tracks")
+                else:
+                    await _safe_answer_query(query, "Queue is empty")
             else:
                 await _safe_answer_query(query, "Unknown control", show_alert=True)
         except Exception as exc:

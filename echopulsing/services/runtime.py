@@ -17,7 +17,9 @@ else:
 from echopulsing.config import Settings
 from echopulsing.services.database import Database
 from echopulsing.services.disabled_voice_service import DisabledVoiceService
+from echopulsing.services.assistant_service import AssistantService
 from echopulsing.services.models import Track
+from echopulsing.services.playback_service import PlaybackService
 from echopulsing.services.queue_manager import QueueManager
 from echopulsing.services.ytdlp_service import YtDlpService
 from echopulsing.utils.player_ui import PlayerUI
@@ -59,8 +61,6 @@ class Runtime:
         self.queue = QueueManager()
         self.ui = PlayerUI(self.bot, self)
         self.ytdlp = YtDlpService(
-            temp_dir=settings.temp_dir,
-            concurrency=settings.download_concurrency,
             cookies_file=settings.ytdlp_cookies_file,
             ffmpeg_location=settings.ffmpeg_location,
         )
@@ -84,6 +84,9 @@ class Runtime:
                     "Use Linux (Docker/WSL/VPS) for voice chat streaming."
                 )
 
+        self.assistant = AssistantService(self.bot, self.user, logger)
+        self.playback = PlaybackService(self.voice, self.ytdlp, logger)
+
     async def _sync_ui_after_auto_transition(self, chat_id: int, track: Track | None) -> None:
         if track is None:
             await self.ui.clear_now_playing(chat_id)
@@ -95,6 +98,7 @@ class Runtime:
         await self.bot.start()
         if self.voice_available and self.calls is not None:
             await self.user.start()
+            await self.assistant.initialize()
             await self.calls.start()
         else:
             self.logger.warning(

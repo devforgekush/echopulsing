@@ -16,6 +16,15 @@ class DisabledVoiceService:
     async def enqueue_or_play(self, chat_id: int, track: Track) -> tuple[str, int]:
         raise self._error()
 
+    async def force_play(self, chat_id: int, new_track: Track) -> Track | None:
+        raise self._error()
+
+    async def prewarm_connection(self, chat_id: int) -> None:
+        raise self._error()
+
+    async def invalidate_prefetch(self, chat_id: int) -> None:
+        return
+
     async def pause(self, chat_id: int) -> None:
         raise self._error()
 

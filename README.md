@@ -1,61 +1,92 @@
 # EchoPulsing Music
 
-EchoPulsing Music is a Telegram music streaming bot for group voice chats. It is built with Pyrogram, PyTgCalls, MongoDB, yt-dlp, and FFmpeg, and it is designed for fast song start-up, inline controls, and clean queue management.
+EchoPulsing Music is a Telegram group voice-chat music bot with low-latency URL streaming.
+It uses yt-dlp direct stream extraction, FFmpeg, PyTgCalls, and MongoDB playlists.
 
 ## Features
-- `/play`, `/pause`, `/resume`, `/skip`, `/stop`, `/end`, `/queue`, `/current`
-- YouTube search and direct URL playback
-- Per-group queue, loop mode, and volume control
-- Now Playing cards with progress refresh and loading feedback
-- Optional cookies support for restricted videos
-- Automatic cleanup of temporary media files
-- Long polling only, no webhooks
+- Fast streaming pipeline: yt-dlp URL extraction -> FFmpeg -> PyTgCalls
+- Per-chat async queue with race-safe playback locks
+- Inline controls with callback actions:
+  - play/pause toggle
+  - skip
+  - loop modes (`off`, `single`, `all`)
+  - shuffle
+- Prefetch (zero-gap playback): resolves next track while current track is playing
+- Queue commands and playlist persistence
+- Cookie fallback for restricted media (`YTDLP_COOKIES_FILE`)
+
+## Requirements
+- Python 3.11+
+- FFmpeg available in PATH (or set `FFMPEG_LOCATION`)
+- MongoDB
+- Telegram API credentials and a user string session
 
 ## Setup
-1. Copy the example environment file:
-	```bash
-	cp .env.example .env
-	```
-2. Install dependencies:
-	```bash
-	python -m pip install -r requirements.txt
-	```
-3. Fill in the required values in `.env`.
-4. Start the bot:
-	```bash
-	python -m echopulsing.main
-	```
+1. Clone repository.
+2. Create env file from example:
+
+```bash
+cp .env.example .env
+```
+
+3. Install dependencies:
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+4. Fill `.env` values.
+5. Run:
+
+```bash
+python -m echopulsing.main
+```
 
 ## Environment Variables
 Required:
-- `API_ID` - Telegram API ID
-- `API_HASH` - Telegram API hash
-- `BOT_TOKEN` - Bot token from BotFather
-- `STRING_SESSION` - User session string for voice chat playback
-- `MONGO_URI` - MongoDB connection string
+- `API_ID`
+- `API_HASH`
+- `BOT_TOKEN`
+- `STRING_SESSION`
+- `MONGO_URI`
 
 Optional:
-- `LOG_CHANNEL_ID` - Log channel for bot events
-- `DOWNLOAD_CONCURRENCY` - Number of parallel yt-dlp jobs
-- `TEMP_DIR` - Temporary download directory
-- `YTDLP_COOKIES_FILE` - Path to a cookies.txt file
-- `FFMPEG_LOCATION` - Custom FFmpeg binary path
+- `LOG_CHANNEL_ID`
+- `YTDLP_COOKIES_FILE` (path to cookies file)
+- `FFMPEG_LOCATION` (directory containing ffmpeg binary)
 
-## Docker Deployment
+## Commands
+- `/play <query or url>`
+- `/pause`
+- `/resume`
+- `/skip`
+- `/stop`
+- `/queue`
+- `/current`
+- `/loop off|single|all`
+- `/volume <10-200>`
+- `/playlist_save <name>`
+- `/playlist_load <name>`
+
+## Docker
+
 ```bash
 docker compose up -d --build
 ```
 
-The Docker setup uses `.env` for secrets and `restart: always` so the bot comes back after host restarts.
+## Deployment Options
+- VPS (Docker Compose)
+- Render (Docker service)
 
-## VPS Deployment
-1. Install Docker and Docker Compose on your VPS.
-2. Clone this repository.
-3. Create `.env` from `.env.example` and add your real credentials.
-4. Run `docker compose up -d --build`.
-5. Check logs with `docker compose logs -f bot`.
+## Security Notes
+- Never commit `.env`, session files, or `cookies.txt`.
+- Keep `STRING_SESSION` private.
+- Rotate credentials if leaked.
 
-## Notes
-- The bot does not use the YouTube Data API.
-- If `cookies.txt` exists in the project root, yt-dlp will use it automatically.
-- Keep `.env`, `cookies.txt`, and session strings private.
+## Architecture
+- `echopulsing/services`: runtime, voice, queue, yt-dlp, db
+- `echopulsing/handlers`: bot command and callback handlers
+- `echopulsing/utils`: UI, logger, helper utilities
+
+## License
+See `LICENSE`.

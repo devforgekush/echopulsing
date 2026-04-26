@@ -10,7 +10,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 BOT_NAME = "EchoPulsing Music"
-DEFAULT_TEMP_DIR = "/tmp/music/"
 
 
 @dataclass(slots=True)
@@ -21,8 +20,6 @@ class Settings:
     string_session: str
     mongo_uri: str
     log_channel_id: int | None
-    download_concurrency: int
-    temp_dir: str
     ytdlp_cookies_file: str | None
     ffmpeg_location: str | None
     bot_name: str = BOT_NAME
@@ -65,8 +62,6 @@ class Settings:
             string_session=string_session or "",
             mongo_uri=mongo_uri or "",
             log_channel_id=log_channel_id,
-            download_concurrency=int(os.getenv("DOWNLOAD_CONCURRENCY", "2")),
-            temp_dir=os.getenv("TEMP_DIR", DEFAULT_TEMP_DIR),
             ytdlp_cookies_file=cookies_path,
             ffmpeg_location=os.getenv("FFMPEG_LOCATION") or None,
         )

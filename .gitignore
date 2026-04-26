@@ -12,6 +12,14 @@ cookies.txt
 # Runtime caches and temp files
 __pycache__/
 *.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
 tmp/
 .tmp/
 .wheelcheck/

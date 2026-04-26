@@ -4,7 +4,6 @@ import asyncio
 import os
 import shutil
 import time
-import tempfile
 from pathlib import Path
 from dataclasses import replace
 from typing import Any
@@ -15,21 +14,17 @@ from echopulsing.services.models import Track
 
 
 class YtDlpService:
-    _CACHE_TTL_SECONDS = 15 * 60
+    _CACHE_TTL_SECONDS = 30 * 60
+    _EXTRACT_RETRIES = 3
 
     def __init__(
         self,
-        temp_dir: str,
-        concurrency: int = 2,
         cookies_file: str | None = None,
         ffmpeg_location: str | None = None,
     ) -> None:
-        self._temp_dir = temp_dir
-        self._sem = asyncio.Semaphore(max(1, concurrency))
         self._cookies_file = self._detect_cookies_file(cookies_file)
         self._ffmpeg_location = ffmpeg_location or self._detect_ffmpeg_location()
         self._track_cache: dict[str, tuple[float, dict[str, Any]]] = {}
-        os.makedirs(self._temp_dir, exist_ok=True)
 
     def _detect_ffmpeg_location(self) -> str | None:
         ffmpeg_path = shutil.which("ffmpeg")
@@ -106,25 +101,136 @@ class YtDlpService:
             return ValueError("Invalid YouTube link or search query.")
         return exc
 
-    async def search(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
+    @staticmethod
+    def _is_retryable_error(exc: Exception) -> bool:
+        message = str(exc).lower()
+        retryable_markers = (
+            "timed out",
+            "timeout",
+            "temporarily unavailable",
+            "temporary failure",
+            "connection reset",
+            "connection aborted",
+            "network error",
+            "http error 429",
+            "http error 503",
+            "too many requests",
+            "remote end closed connection",
+            "unable to download",
+            "transport error",
+        )
+        return any(marker in message for marker in retryable_markers)
+
+    @staticmethod
+    def _is_cookie_related_error(exc: Exception) -> bool:
+        message = str(exc).lower()
+        cookie_markers = (
+            "sign in to confirm your age",
+            "age-restricted",
+            "confirm your age",
+            "cookie",
+            "login required",
+            "for this video",
+        )
+        return any(marker in message for marker in cookie_markers)
+
+    @staticmethod
+    def _is_invalid_cookie_error(exc: Exception) -> bool:
+        message = str(exc).lower()
+        invalid_markers = (
+            "cookie file",
+            "cookies",
+            "cookiejar",
+            "expired",
+            "invalid cookie",
+            "invalid cookies",
+        )
+        return any(marker in message for marker in invalid_markers)
+
+    @staticmethod
+    def _first_entry(data: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not data:
+            return None
+        if isinstance(data, dict) and data.get("entries"):
+            return data["entries"][0]
+        return data
+
+    async def _extract_info(
+        self,
+        target: str,
+        *,
+        default_search: str | None = None,
+        use_cookies: bool = False,
+        extract_flat: bool = False,
+    ) -> dict[str, Any]:
         ydl_opts = {
             "quiet": True,
             "skip_download": True,
-            "extract_flat": "in_playlist",
-            "default_search": f"ytsearch{limit}",
+            "noplaylist": True,
+            "format": "bestaudio/best",
+            "geo_bypass": True,
+            "nocheckcertificate": True,
+            "no_warnings": True,
         }
-        if self._cookies_file:
+        if default_search:
+            ydl_opts["default_search"] = default_search
+        if extract_flat:
+            ydl_opts["extract_flat"] = "in_playlist"
+        if use_cookies and self._cookies_file:
             ydl_opts["cookiefile"] = self._cookies_file
         if self._ffmpeg_location:
             ydl_opts["ffmpeg_location"] = self._ffmpeg_location
 
-        def _run() -> list[dict[str, Any]]:
+        def _run() -> dict[str, Any]:
             with YoutubeDL(ydl_opts) as ydl:
-                data = ydl.extract_info(query, download=False)
-                return data.get("entries", []) if data else []
+                data = ydl.extract_info(target, download=False)
+                return data or {}
 
+        return await asyncio.to_thread(_run)
+
+    async def _extract_with_fallback(
+        self,
+        target: str,
+        *,
+        default_search: str | None = None,
+    ) -> dict[str, Any]:
+        attempts = [False]
+        if self._cookies_file:
+            attempts.append(True)
+
+        last_error: Exception | None = None
+
+        for use_cookies in attempts:
+            for attempt in range(self._EXTRACT_RETRIES):
+                try:
+                    return await self._extract_info(
+                        target,
+                        default_search=default_search,
+                        use_cookies=use_cookies,
+                    )
+                except Exception as exc:
+                    last_error = exc
+                    if use_cookies and self._is_invalid_cookie_error(exc):
+                        raise ValueError(
+                            "cookies.txt is invalid or expired. Refresh it and retry."
+                        ) from exc
+                    if not self._is_retryable_error(exc) or attempt >= self._EXTRACT_RETRIES - 1:
+                        break
+                    await asyncio.sleep(0.25 * (attempt + 1))
+
+        if last_error is not None:
+            if not self._cookies_file and self._is_cookie_related_error(last_error):
+                raise ValueError(
+                    "This video requires cookies.txt. Set YTDLP_COOKIES_FILE and try again."
+                ) from last_error
+            raise self._friendly_error(last_error) from last_error
+
+        raise RuntimeError("Could not resolve stream URL")
+
+    async def search(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
         try:
-            return await asyncio.to_thread(_run)
+            data = await self._extract_info(query, default_search=f"ytsearch{limit}", extract_flat=True)
+            return data.get("entries", []) if data else []
         except Exception as exc:
             raise self._friendly_error(exc) from exc
 
@@ -143,43 +249,22 @@ class YtDlpService:
                 stream_url=cached.get("stream_url"),
             )
 
-        ydl_opts = {
-            "quiet": True,
-            "skip_download": True,
-            "default_search": "ytsearch1",
-            "noplaylist": True,
-            "format": "bestaudio/best",
-            "geo_bypass": True,
-            "nocheckcertificate": True,
-            "no_warnings": True,
-        }
-        if self._cookies_file:
-            ydl_opts["cookiefile"] = self._cookies_file
-        if self._ffmpeg_location:
-            ydl_opts["ffmpeg_location"] = self._ffmpeg_location
-
-        def _run() -> dict[str, Any]:
-            with YoutubeDL(ydl_opts) as ydl:
-                data = ydl.extract_info(query_or_url, download=False)
-                if "entries" in data and data["entries"]:
-                    return data["entries"][0]
-                return data
-
         try:
-            data = await asyncio.to_thread(_run)
+            data = await self._extract_with_fallback(query_or_url, default_search="ytsearch1")
         except Exception as exc:
             raise self._friendly_error(exc) from exc
 
+        data = self._first_entry(data)
         if not data:
             raise ValueError("No results found")
 
-        webpage_url = data.get("webpage_url") or data.get("url")
+        webpage_url = data.get("webpage_url") or data.get("original_url") or query_or_url
         if not webpage_url:
             raise ValueError("Could not resolve media URL")
 
         direct_url = data.get("url")
         if not self._is_direct_stream_url(direct_url):
-            direct_url = None
+            raise ValueError("Could not resolve a direct stream URL")
 
         source_url = webpage_url
         payload = {
@@ -205,56 +290,42 @@ class YtDlpService:
             stream_url=payload["stream_url"],
         )
 
-    async def download_audio(self, track: Track) -> Track:
-        async with self._sem:
-            target_dir = tempfile.mkdtemp(prefix="music_", dir=self._temp_dir)
-            outtmpl = os.path.join(target_dir, "%(id)s.%(ext)s")
-            ydl_opts = {
-                "format": "bestaudio/best",
-                "outtmpl": outtmpl,
-                "quiet": True,
-                "noplaylist": True,
-                "postprocessors": [
-                    {
-                        "key": "FFmpegExtractAudio",
-                        "preferredcodec": "mp3",
-                        "preferredquality": "192",
-                    }
-                ],
-            }
-            if self._cookies_file:
-                ydl_opts["cookiefile"] = self._cookies_file
-            if self._ffmpeg_location:
-                ydl_opts["ffmpeg_location"] = self._ffmpeg_location
+    async def ensure_stream_url(self, track: Track) -> Track:
+        if self._is_direct_stream_url(track.stream_url):
+            return track
 
-            def _run() -> str:
-                with YoutubeDL(ydl_opts) as ydl:
-                    ydl.download([track.webpage_url])
-                for name in os.listdir(target_dir):
-                    if name.endswith(".mp3"):
-                        return os.path.join(target_dir, name)
-                raise RuntimeError("Audio file not produced by yt-dlp")
+        lookup_keys = [track.webpage_url, track.source_url, track.id or ""]
+        for key in lookup_keys:
+            if not key:
+                continue
+            cached = self._get_cached_payload(key)
+            if cached and self._is_direct_stream_url(cached.get("stream_url")):
+                return replace(track, stream_url=cached.get("stream_url"))
 
-            try:
-                track.file_path = await asyncio.to_thread(_run)
-                return track
-            except Exception as exc:
-                self.cleanup_directory(target_dir)
-                raise self._friendly_error(exc) from exc
+        try:
+            data = await self._extract_with_fallback(track.webpage_url)
+        except Exception:
+            return track
 
-    def cleanup_directory(self, dir_path: str) -> None:
-        if os.path.isdir(dir_path) and not os.listdir(dir_path):
-            os.rmdir(dir_path)
+        data = self._first_entry(data)
+        if not data:
+            return track
 
-    async def cleanup_track_file(self, track: Track | None) -> None:
-        if not track or not track.file_path:
-            return
-        file_path = track.file_path
-        dir_path = os.path.dirname(file_path)
+        direct_url = data.get("url")
+        if not self._is_direct_stream_url(direct_url):
+            return track
 
-        def _cleanup() -> None:
-            if os.path.isfile(file_path):
-                os.remove(file_path)
-            self.cleanup_directory(dir_path)
+        payload = {
+            "id": data.get("id") or track.id,
+            "title": data.get("title") or track.title,
+            "source_url": data.get("webpage_url") or track.source_url,
+            "webpage_url": data.get("webpage_url") or track.webpage_url,
+            "duration": data.get("duration") or track.duration,
+            "thumbnail": data.get("thumbnail") or track.thumbnail,
+            "stream_url": direct_url,
+        }
+        self._store_cached_payload(track.webpage_url, payload)
+        self._store_cached_payload(track.source_url, payload)
 
-        await asyncio.to_thread(_cleanup)
+        return replace(track, stream_url=direct_url)
+

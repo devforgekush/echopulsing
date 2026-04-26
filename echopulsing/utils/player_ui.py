@@ -50,18 +50,26 @@ class PlayerUI:
         return value[: max(0, max_len - 3)].rstrip() + "..."
 
     @staticmethod
-    def controls_markup() -> InlineKeyboardMarkup:
+    def _loop_label(mode: str) -> str:
+        if mode == "single":
+            return "🔁 Single"
+        if mode == "all":
+            return "🔁 All"
+        return "🔁 Off"
+
+    async def controls_markup(self, chat_id: int) -> InlineKeyboardMarkup:
+        paused = await self.runtime.voice.is_paused(chat_id)
+        loop_mode = await self.runtime.queue.get_loop_mode(chat_id)
+        play_pause = "▶️ Play" if paused else "⏸ Pause"
         return InlineKeyboardMarkup(
             [
                 [
-                    InlineKeyboardButton("⏯ Pause", callback_data="player:pause"),
+                    InlineKeyboardButton(play_pause, callback_data="player:toggle"),
                     InlineKeyboardButton("⏭ Skip", callback_data="player:skip"),
-                    InlineKeyboardButton("⏹ Stop", callback_data="player:stop"),
                 ],
                 [
-                    InlineKeyboardButton("🔁 Loop", callback_data="player:loop"),
-                    InlineKeyboardButton("🔉 Vol-", callback_data="player:voldown"),
-                    InlineKeyboardButton("🔊 Vol+", callback_data="player:volup"),
+                    InlineKeyboardButton(self._loop_label(loop_mode), callback_data="player:loop"),
+                    InlineKeyboardButton("🔀 Shuffle", callback_data="player:shuffle"),
                 ],
             ]
         )
@@ -120,7 +128,7 @@ class PlayerUI:
         async with self._locks[chat_id]:
             await self._delete_previous(chat_id)
             body = await self._build_body(chat_id, track)
-            markup = self.controls_markup()
+            markup = await self.controls_markup(chat_id)
             sent: Message
             is_photo = False
 
@@ -187,7 +195,7 @@ class PlayerUI:
                             ref.message_id,
                             caption=body,
                             parse_mode=enums.ParseMode.HTML,
-                            reply_markup=self.controls_markup(),
+                            reply_markup=await self.controls_markup(chat_id),
                         )
                     else:
                         await self.bot.edit_message_text(
@@ -195,10 +203,12 @@ class PlayerUI:
                             ref.message_id,
                             text=body,
                             parse_mode=enums.ParseMode.HTML,
-                            reply_markup=self.controls_markup(),
+                            reply_markup=await self.controls_markup(chat_id),
                         )
                     ref.last_body = body
-                except Exception:
+                except Exception as exc:
+                    if "MESSAGE_NOT_MODIFIED" in str(exc):
+                        return
                     resend_required = True
                     await self._delete_previous(chat_id)
                     self._last_now_playing.pop(chat_id, None)
