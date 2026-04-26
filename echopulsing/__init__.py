@@ -1,0 +1,1 @@
+"""EchoPulsing Music bot package."""

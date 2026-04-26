@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "echopulsing"
+version = "0.1.0"
+description = "EchoPulsing Music Telegram streaming bot"
+requires-python = ">=3.11"
+dependencies = [
+	"pyrogram==2.0.106",
+	"tgcrypto==1.2.5",
+	"py-tgcalls==2.2.5",
+	"ntgcalls==2.0.5; platform_system == 'Windows'",
+	"ntgcalls==2.1.0; platform_system != 'Windows'",
+	"motor==3.6.0",
+	"yt-dlp==2026.3.17",
+	"python-dotenv==1.0.1",
+	"imageio-ffmpeg==0.6.0",
+]
+
+[project.scripts]
+echopulsing = "echopulsing.main:main"

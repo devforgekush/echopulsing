@@ -1,0 +1,25 @@
+# Secrets and environment
+.env
+.env.*
+!.env.example
+
+# Pyrogram session artifacts
+*.session
+*.session-journal
+cookies.txt
+*.session.backup
+
+# Runtime caches and temp files
+__pycache__/
+*.pyc
+tmp/
+.tmp/
+.wheelcheck/
+downloads/
+node_modules/
+*.log
+
+# OS/editor artifacts
+.DS_Store
+Thumbs.db
+.vscode/
