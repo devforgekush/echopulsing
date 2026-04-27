@@ -14,6 +14,9 @@ from echopulsing.services.ytdlp_service import YtDlpService
 
 
 class VoiceService:
+    _AUTO_LEAVE_DELAY_SECONDS = 60
+    _AUTO_LEAVE_CHECK_INTERVAL_SECONDS = 5
+
     def __init__(
         self,
         calls: PyTgCalls,
@@ -32,6 +35,7 @@ class VoiceService:
         self._chat_locks: dict[int, asyncio.Lock] = {}
         self._prefetch_cache: dict[int, Track] = {}
         self._prefetch_tasks: dict[int, asyncio.Task[None]] = {}
+        self._auto_leave_tasks: dict[int, asyncio.Task[None]] = {}
         self._auto_transition_callback: Callable[[int, Track | None], Awaitable[None]] | None = None
         self._register_stream_end_handler()
 
@@ -125,7 +129,88 @@ class VoiceService:
     async def _is_connected(self, chat_id: int) -> bool:
         return await self._group_call_is_active(chat_id)
 
+    async def _participant_count(self, chat_id: int) -> int | None:
+        try:
+            if hasattr(self.calls, "get_participants"):
+                participants = await self.calls.get_participants(chat_id)
+                return len(list(participants))
+            if hasattr(self.calls, "get_group_call_participants"):
+                participants = await self.calls.get_group_call_participants(chat_id)
+                return len(list(participants))
+        except Exception as exc:
+            self.logger.debug("Could not fetch VC participants in chat %s: %s", chat_id, exc)
+            return None
+        return None
+
+    async def _is_only_bot_in_vc(self, chat_id: int) -> bool:
+        if not await self._is_connected(chat_id):
+            return False
+        participant_count = await self._participant_count(chat_id)
+        if participant_count is None:
+            return False
+        return participant_count <= 1
+
+    def _cancel_auto_leave_timer(self, chat_id: int) -> None:
+        task = self._auto_leave_tasks.pop(chat_id, None)
+        if task and not task.done():
+            task.cancel()
+
+    async def _refresh_auto_leave_watch(self, chat_id: int) -> None:
+        if not await self._is_connected(chat_id):
+            self._cancel_auto_leave_timer(chat_id)
+            return
+
+        if not await self._is_only_bot_in_vc(chat_id):
+            self._cancel_auto_leave_timer(chat_id)
+            return
+
+        task = self._auto_leave_tasks.get(chat_id)
+        if task and not task.done():
+            return
+
+        self._auto_leave_tasks[chat_id] = asyncio.create_task(self._auto_leave_when_empty(chat_id))
+
+    async def _auto_leave_when_empty(self, chat_id: int) -> None:
+        deadline = time.monotonic() + self._AUTO_LEAVE_DELAY_SECONDS
+        try:
+            while True:
+                if not await self._is_connected(chat_id):
+                    return
+
+                if not await self._is_only_bot_in_vc(chat_id):
+                    self.logger.info("Auto-leave canceled in chat %s: participants joined", chat_id)
+                    return
+
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+
+                await asyncio.sleep(min(self._AUTO_LEAVE_CHECK_INTERVAL_SECONDS, remaining))
+
+            async with self._chat_lock(chat_id):
+                if not await self._is_connected(chat_id):
+                    return
+                if not await self._is_only_bot_in_vc(chat_id):
+                    self.logger.info("Auto-leave aborted in chat %s: participants joined", chat_id)
+                    return
+
+                try:
+                    await self.calls.leave_call(chat_id)
+                except Exception:
+                    pass
+
+                await self._reset_state(chat_id, "auto-leave: alone in VC for 60s", keep_queue=True)
+                await self._notify_auto_transition(chat_id, None)
+                self.logger.info("Auto-left voice chat %s after 60s with no participants", chat_id)
+        except asyncio.CancelledError:
+            return
+        finally:
+            task = self._auto_leave_tasks.get(chat_id)
+            if task and task.done():
+                self._auto_leave_tasks.pop(chat_id, None)
+
     async def _reset_state(self, chat_id: int, reason: str, keep_queue: bool = True) -> None:
+        self._cancel_auto_leave_timer(chat_id)
         self._active_chats.discard(chat_id)
         self._started_at.pop(chat_id, None)
         self._paused_at.pop(chat_id, None)
@@ -213,6 +298,7 @@ class VoiceService:
                 if not was_connected:
                     self.logger.info("VC reconnected in chat %s", chat_id)
                 self.logger.info("Stream started in chat %s", chat_id)
+                await self._refresh_auto_leave_watch(chat_id)
                 return
             except Exception as exc:
                 self.logger.warning(
@@ -293,6 +379,9 @@ class VoiceService:
             current = await self.queue.get_current(chat_id)
             connected = await self._is_connected(chat_id)
             is_playing = bool(current and chat_id in self._active_chats)
+
+            if connected:
+                await self._refresh_auto_leave_watch(chat_id)
 
             if not connected and current:
                 await self._reset_state(chat_id, "stale player state detected", keep_queue=True)

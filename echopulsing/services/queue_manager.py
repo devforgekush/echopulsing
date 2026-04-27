@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import defaultdict
+from typing import Callable
 
 from echopulsing.services.models import Track
 from echopulsing.services.queue_state import AsyncTrackQueue, ChatState
@@ -46,6 +47,14 @@ class QueueManager:
     async def list_queue(self, chat_id: int) -> list[Track]:
         state = self._state(chat_id)
         return await state.queue.snapshot()
+
+    async def remove_queued_track(
+        self,
+        chat_id: int,
+        predicate: Callable[[Track], bool],
+    ) -> Track | None:
+        state = self._state(chat_id)
+        return await state.queue.remove_first(predicate)
 
     async def clear(self, chat_id: int) -> list[Track]:
         state = self._state(chat_id)

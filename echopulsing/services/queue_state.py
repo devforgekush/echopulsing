@@ -4,7 +4,7 @@ import asyncio
 import random
 from collections import deque
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 if TYPE_CHECKING:
     from echopulsing.services.models import Track
@@ -46,6 +46,17 @@ class AsyncTrackQueue:
             tracks = list(self._items)
             self._items.clear()
             return tracks
+
+    async def remove_first(self, predicate: Callable[[Track], bool]) -> Track | None:
+        async with self._lock:
+            for index, track in enumerate(self._items):
+                if not predicate(track):
+                    continue
+                items = list(self._items)
+                removed = items.pop(index)
+                self._items = deque(items)
+                return removed
+            return None
 
     async def size(self) -> int:
         async with self._lock:

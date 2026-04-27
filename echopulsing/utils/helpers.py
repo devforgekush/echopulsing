@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import os
+import time
 
 from pyrogram.client import Client
 from pyrogram.enums import ChatMemberStatus
 from pyrogram.types import Message
+
+
+_PROCESS_STARTED_AT = time.monotonic()
 
 
 def _parse_user_id(value: str | None) -> int | None:
@@ -62,3 +66,43 @@ def format_seconds(total_seconds: int | None) -> str:
     if hours:
         return f"{hours}:{minutes:02d}:{seconds:02d}"
     return f"{minutes}:{seconds:02d}"
+
+
+def trim_title(title: str | None, max_length: int = 60) -> str:
+    value = (title or "").strip()
+    if not value:
+        return "Unknown title"
+    if max_length <= 3:
+        return value[:max_length]
+    if len(value) <= max_length:
+        return value
+    return f"{value[: max_length - 3].rstrip()}..."
+
+
+def get_system_usage_percent() -> tuple[str, str]:
+    try:
+        import psutil  # type: ignore
+
+        cpu = max(0.0, min(100.0, float(psutil.cpu_percent(interval=0.1))))
+        ram = max(0.0, min(100.0, float(psutil.virtual_memory().percent)))
+        return f"{cpu:.0f}%", f"{ram:.0f}%"
+    except Exception:
+        return "N/A", "N/A"
+
+
+def get_uptime_seconds() -> int:
+    return max(0, int(time.monotonic() - _PROCESS_STARTED_AT))
+
+
+def format_uptime(total_seconds: int) -> str:
+    seconds = max(0, int(total_seconds))
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    if days:
+        return f"{days}d {hours:02d}h {minutes:02d}m {secs:02d}s"
+    if hours:
+        return f"{hours:02d}h {minutes:02d}m {secs:02d}s"
+    if minutes:
+        return f"{minutes:02d}m {secs:02d}s"
+    return f"{secs}s"

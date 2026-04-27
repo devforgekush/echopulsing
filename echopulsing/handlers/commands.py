@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import html
+import hashlib
 import os
+import subprocess
 import sys
 import time
 from typing import TYPE_CHECKING
@@ -10,13 +13,32 @@ from pyrogram import Client, enums, filters
 from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from echopulsing.services.models import Track
-from echopulsing.utils.helpers import command_arg, format_seconds, is_admin, is_authorized
+from echopulsing.utils.helpers import (
+    command_arg,
+    format_seconds,
+    format_uptime,
+    get_system_usage_percent,
+    get_uptime_seconds,
+    is_admin,
+    is_authorized,
+    trim_title,
+)
 
 if TYPE_CHECKING:
     from echopulsing.services.runtime import Runtime
 
 
 _RECENT_PLAY_MESSAGES: dict[tuple[int, int], float] = {}
+
+
+def _owner_user_id() -> int | None:
+    raw = (os.getenv("OWNER_ID") or "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
 
 
 def _display_name(message: Message) -> str:
@@ -39,6 +61,30 @@ def _track_card(track: Track, header: str) -> str:
         f"• <b>Title:</b> <code>{title}</code>\n"
         f"• <b>Duration:</b> <code>{duration}</code>\n"
         f"• <b>Requested by:</b> <code>{requester}</code>"
+    )
+
+
+def _track_force_signature(track: Track) -> str:
+    payload = f"{track.id or ''}|{track.webpage_url}|{track.created_at:.6f}|{track.requester_id}"
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:20]
+
+
+def _queue_added_card(track: Track, position: int) -> str:
+    title = _escape(trim_title(track.title, 60))
+    duration = _escape(format_seconds(track.duration))
+    requester = _escape(track.requester_name)
+    return (
+        f"🎶 <b>Added to Queue:</b> #{position}\n\n"
+        f"▶️ <b>Title:</b> <code>{title}</code>\n"
+        f"⏱ <b>Duration:</b> <code>{duration}</code>\n"
+        f"👤 <b>Requested by:</b> <code>{requester}</code>"
+    )
+
+
+def _queue_added_keyboard(track: Track) -> InlineKeyboardMarkup:
+    token = _track_force_signature(track)
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("▶️ Play Now", callback_data=f"player:force:{token}")]]
     )
 
 
@@ -100,7 +146,8 @@ async def _execute_playback(
             await runtime.ui.show_now_playing(message.chat.id, result.track)
         else:
             await message.reply_text(
-                f"🎶 Queued at position #{result.position}: {_escape(result.track.title)}",
+                _queue_added_card(result.track, result.position),
+                reply_markup=_queue_added_keyboard(result.track),
                 parse_mode=enums.ParseMode.HTML,
             )
     except ValueError as exc:
@@ -246,6 +293,65 @@ def register(app: Client, runtime: Runtime) -> None:
         except Exception as exc:
             await runtime.log_event(f"/restart failed in chat {message.chat.id}: {exc}")
             await message.reply_text("❌ Restart failed")
+
+    @app.on_message(filters.command(["update"]))
+    async def update_handler(client: Client, message: Message) -> None:
+        if not message.from_user:
+            await message.reply_text("❌ Not allowed")
+            return
+
+        owner_id = _owner_user_id()
+        if owner_id is None or message.from_user.id != owner_id:
+            await runtime.log_event(f"Unauthorized /update by {message.from_user.id} in chat {message.chat.id}")
+            await message.reply_text("❌ Not allowed")
+            return
+
+        await message.reply_text("🔄 Updating bot from git...")
+        result = await asyncio.to_thread(
+            subprocess.run,
+            ["git", "pull"],
+            capture_output=True,
+            text=True,
+        )
+
+        output = (result.stdout or "").strip()
+        error_output = (result.stderr or "").strip()
+
+        if result.returncode != 0:
+            details = error_output or output or "Unknown git pull error"
+            await runtime.log_event(f"/update failed in chat {message.chat.id}: {details}")
+            await message.reply_text(f"❌ Update failed:\n{details}")
+            return
+
+        success_text = output or "Already up to date."
+        await runtime.log_event(f"/update succeeded in chat {message.chat.id}: {success_text}")
+        await message.reply_text(f"✅ Update successful:\n{success_text}\n\n♻️ Restarting bot...")
+        try:
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+        except Exception as exc:
+            await runtime.log_event(f"/update restart failed in chat {message.chat.id}: {exc}")
+            await message.reply_text("❌ Restart failed after update")
+
+    @app.on_message(filters.command(["ping"]))
+    async def ping_handler(client: Client, message: Message) -> None:
+        started = time.perf_counter()
+        status = await message.reply_text("🏓 Pong!")
+        latency_ms = max(1, int((time.perf_counter() - started) * 1000))
+
+        cpu, ram = get_system_usage_percent()
+        uptime = format_uptime(get_uptime_seconds())
+        body = (
+            "🏓 Pong!\n"
+            f"⚡ Latency: {latency_ms} ms\n"
+            f"🧠 CPU: {cpu}\n"
+            f"💾 RAM: {ram}\n"
+            f"⏱ Uptime: {uptime}"
+        )
+
+        try:
+            await status.edit_text(body)
+        except Exception:
+            await message.reply_text(body)
 
     @app.on_message(filters.command(["play"]) & filters.group)
     async def play_handler(client: Client, message: Message) -> None:
@@ -532,18 +638,68 @@ def register(app: Client, runtime: Runtime) -> None:
         if not query.message:
             await _safe_answer_query(query, "Control target was not found.", show_alert=True)
             return
-        if not await _require_admin_query(client, query):
-            return
 
         chat_id = query.message.chat.id
-        action = (query.data or "").split(":", maxsplit=1)[-1]
+        parts = (query.data or "").split(":", maxsplit=2)
+        if len(parts) < 2:
+            await _safe_answer_query(query, "Unknown control", show_alert=True)
+            return
+        action = parts[1]
 
         try:
-            if action == "toggle":
+            if action == "force":
+                if not query.from_user:
+                    await _safe_answer_query(query, "Only real user accounts can use this control.", show_alert=True)
+                    return
+                token = parts[2] if len(parts) > 2 else ""
+                if not token:
+                    await _safe_answer_query(query, "Track reference is missing.", show_alert=True)
+                    return
+
+                queued = await runtime.queue.list_queue(chat_id)
+                selected = next(
+                    (
+                        track
+                        for track in queued
+                        if _track_force_signature(track) == token or (track.id and track.id == token)
+                    ),
+                    None,
+                )
+                if selected is None:
+                    await _safe_answer_query(query, "Track is no longer queued.", show_alert=True)
+                    return
+
+                is_owner = query.from_user.id == selected.requester_id
+                is_chat_admin = await is_admin(client, chat_id, query.from_user.id)
+                if not is_owner and not is_chat_admin:
+                    await _safe_answer_query(query, "Only requester or admins can use this button.", show_alert=True)
+                    return
+
+                target = await runtime.queue.remove_queued_track(
+                    chat_id,
+                    lambda track: _track_force_signature(track) == token or (track.id and track.id == token),
+                )
+                if target is None:
+                    await _safe_answer_query(query, "Track is no longer queued.", show_alert=True)
+                    return
+
+                started = await runtime.voice.force_play(chat_id, target)
+                if started is None:
+                    await _safe_answer_query(query, "Failed to start forced playback.", show_alert=True)
+                    return
+
+                await runtime.ui.show_now_playing(chat_id, started)
+                await runtime.ui.refresh_now_playing(chat_id, force=True)
+                await _safe_answer_query(query, "Playing now")
+            elif action == "toggle":
+                if not await _require_admin_query(client, query):
+                    return
                 paused = await runtime.voice.toggle_pause(chat_id)
                 await runtime.ui.refresh_now_playing(chat_id, force=True)
                 await _safe_answer_query(query, "Paused" if paused else "Playing")
             elif action == "skip":
+                if not await _require_admin_query(client, query):
+                    return
                 next_track = await runtime.voice.skip(chat_id)
                 if next_track:
                     await runtime.ui.show_now_playing(chat_id, next_track)
@@ -552,10 +708,14 @@ def register(app: Client, runtime: Runtime) -> None:
                     await runtime.ui.clear_now_playing(chat_id)
                     await _safe_answer_query(query, "Queue is now empty")
             elif action == "loop":
+                if not await _require_admin_query(client, query):
+                    return
                 mode = await runtime.queue.cycle_loop_mode(chat_id)
                 await runtime.ui.refresh_now_playing(chat_id, force=True)
                 await _safe_answer_query(query, f"Loop mode: {mode}")
             elif action == "shuffle":
+                if not await _require_admin_query(client, query):
+                    return
                 count = await runtime.queue.shuffle(chat_id)
                 await runtime.voice.invalidate_prefetch(chat_id)
                 await runtime.ui.refresh_now_playing(chat_id, force=True)
@@ -563,6 +723,12 @@ def register(app: Client, runtime: Runtime) -> None:
                     await _safe_answer_query(query, f"Shuffled {count} queued tracks")
                 else:
                     await _safe_answer_query(query, "Queue is empty")
+            elif action == "stop":
+                if not await _require_admin_query(client, query):
+                    return
+                await runtime.voice.stop(chat_id)
+                await runtime.ui.clear_now_playing(chat_id)
+                await _safe_answer_query(query, "Stopped")
             else:
                 await _safe_answer_query(query, "Unknown control", show_alert=True)
         except Exception as exc:

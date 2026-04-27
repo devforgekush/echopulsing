@@ -17,10 +17,14 @@ class _NowPlayingRef:
     message_id: int
     is_photo: bool
     last_body: str
+    last_controls_signature: str
     track_signature: str
 
 
 class PlayerUI:
+    _PROGRESS_TICKS = 11
+    _PROGRESS_REFRESH_SECONDS = 5
+
     def __init__(self, bot: Client, runtime: object) -> None:
         self.bot = bot
         self.runtime = runtime
@@ -34,13 +38,17 @@ class PlayerUI:
 
     @staticmethod
     def _progress_bar(elapsed: int, duration: int | None) -> str:
-        total_blocks = 10
+        width = PlayerUI._PROGRESS_TICKS
+        if width <= 1:
+            return "●"
         if not duration or duration <= 0:
-            return "▰" * total_blocks
-        ratio = max(0.0, min(1.0, elapsed / duration))
-        filled = int(round(ratio * total_blocks))
-        filled = max(0, min(total_blocks, filled))
-        return ("▰" * filled) + ("▱" * (total_blocks - filled))
+            pointer = width // 2
+        else:
+            ratio = max(0.0, min(1.0, elapsed / duration))
+            pointer = int(round(ratio * (width - 1)))
+        chars = ["─"] * width
+        chars[pointer] = "●"
+        return "".join(chars)
 
     @staticmethod
     def _trim_text(text: str | None, max_len: int) -> str:
@@ -52,27 +60,44 @@ class PlayerUI:
     @staticmethod
     def _loop_label(mode: str) -> str:
         if mode == "single":
-            return "🔁 Single"
+            return "🔁 Loop: 1"
         if mode == "all":
-            return "🔁 All"
-        return "🔁 Off"
+            return "🔁 Loop: All"
+        return "🔁 Loop: Off"
+
+    @staticmethod
+    def _controls_signature(paused: bool, loop_mode: str) -> str:
+        return f"paused={int(paused)}|loop={loop_mode}"
+
+    @staticmethod
+    def _progress_line(elapsed: int, duration: int | None) -> str:
+        remaining = max(0, (duration or 0) - elapsed)
+        elapsed_text = format_seconds(elapsed)
+        remaining_text = f"-{format_seconds(remaining)}" if duration and duration > 0 else "-live"
+        return f"{elapsed_text} {PlayerUI._progress_bar(elapsed, duration)} {remaining_text}"
 
     async def controls_markup(self, chat_id: int) -> InlineKeyboardMarkup:
         paused = await self.runtime.voice.is_paused(chat_id)
         loop_mode = await self.runtime.queue.get_loop_mode(chat_id)
-        play_pause = "▶️ Play" if paused else "⏸ Pause"
+        play_pause = "⏯ Resume" if paused else "⏯ Pause"
         return InlineKeyboardMarkup(
             [
                 [
                     InlineKeyboardButton(play_pause, callback_data="player:toggle"),
                     InlineKeyboardButton("⏭ Skip", callback_data="player:skip"),
+                    InlineKeyboardButton(self._loop_label(loop_mode), callback_data="player:loop"),
                 ],
                 [
-                    InlineKeyboardButton(self._loop_label(loop_mode), callback_data="player:loop"),
                     InlineKeyboardButton("🔀 Shuffle", callback_data="player:shuffle"),
+                    InlineKeyboardButton("⏹ Stop", callback_data="player:stop"),
                 ],
             ]
         )
+
+    async def _controls_state(self, chat_id: int) -> tuple[InlineKeyboardMarkup, str]:
+        paused = await self.runtime.voice.is_paused(chat_id)
+        loop_mode = await self.runtime.queue.get_loop_mode(chat_id)
+        return await self.controls_markup(chat_id), self._controls_signature(paused, loop_mode)
 
     async def loading_animation(self, message: Message) -> Message | None:
         sequence = [
@@ -96,23 +121,17 @@ class PlayerUI:
     async def _build_body(self, chat_id: int, track: Track) -> str:
         elapsed = await self.runtime.voice.get_elapsed(chat_id)
         duration = track.duration
-        current_time = format_seconds(elapsed)
-        duration_text = format_seconds(duration)
-        volume = await self.runtime.queue.get_volume(chat_id)
 
-        title = _escape_html(self._trim_text(track.title, 80))
+        title = _escape_html(self._trim_text(track.title, 70))
         requester_name = _escape_html(self._trim_text(track.requester_name, 40))
+        progress = _escape_html(self._progress_line(elapsed, duration))
 
         return (
-            "🎧 EchoPulsing Music\n"
-            "━━━━━━━━━━━━━━━━━━\n"
-            f"🎵 <b>{title}</b>\n"
-            f"👤 Requested by: {requester_name}\n"
-            f"⏱ {current_time} / {duration_text}\n\n"
-            f"{self._progress_bar(elapsed, duration)}\n\n"
-            f"🔊 Volume: {volume}%\n"
-            "━━━━━━━━━━━━━━━━━━\n"
-            "SOURCE: YouTube"
+            "🎵 <b>Now Playing</b>\n\n"
+            f"▶️ <b>Title:</b> <code>{title}</code>\n"
+            f"👤 <b>Requested by:</b> <code>{requester_name}</code>\n\n"
+            "⏳ <b>Progress:</b>\n"
+            f"<code>{progress}</code>"
         )
 
     async def _delete_previous(self, chat_id: int) -> None:
@@ -128,7 +147,7 @@ class PlayerUI:
         async with self._locks[chat_id]:
             await self._delete_previous(chat_id)
             body = await self._build_body(chat_id, track)
-            markup = await self.controls_markup(chat_id)
+            markup, controls_signature = await self._controls_state(chat_id)
             sent: Message
             is_photo = False
 
@@ -161,6 +180,7 @@ class PlayerUI:
                 message_id=sent.id,
                 is_photo=is_photo,
                 last_body=body,
+                last_controls_signature=controls_signature,
                 track_signature=self._track_signature(track),
             )
 
@@ -179,7 +199,8 @@ class PlayerUI:
             return
 
         body = await self._build_body(chat_id, current)
-        if not force and body == ref.last_body:
+        markup, controls_signature = await self._controls_state(chat_id)
+        if body == ref.last_body and controls_signature == ref.last_controls_signature:
             return
 
         resend_required = False
@@ -195,7 +216,7 @@ class PlayerUI:
                             ref.message_id,
                             caption=body,
                             parse_mode=enums.ParseMode.HTML,
-                            reply_markup=await self.controls_markup(chat_id),
+                            reply_markup=markup,
                         )
                     else:
                         await self.bot.edit_message_text(
@@ -203,9 +224,10 @@ class PlayerUI:
                             ref.message_id,
                             text=body,
                             parse_mode=enums.ParseMode.HTML,
-                            reply_markup=await self.controls_markup(chat_id),
+                            reply_markup=markup,
                         )
                     ref.last_body = body
+                    ref.last_controls_signature = controls_signature
                 except Exception as exc:
                     if "MESSAGE_NOT_MODIFIED" in str(exc):
                         return
@@ -240,7 +262,7 @@ class PlayerUI:
     async def _progress_loop(self, chat_id: int) -> None:
         try:
             while True:
-                await asyncio.sleep(18)
+                await asyncio.sleep(self._PROGRESS_REFRESH_SECONDS)
                 current = await self.runtime.queue.get_current(chat_id)
                 if not current:
                     await self.clear_now_playing(chat_id)
