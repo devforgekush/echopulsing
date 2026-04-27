@@ -39,6 +39,8 @@ class VoiceService:
         self._auto_leave_tasks: dict[int, asyncio.Task[None]] = {}
         self._loop_all_enabled: dict[int, bool] = {}
         self._auto_transition_callback: Callable[[int, Track | None], Awaitable[None]] | None = None
+        self._assistant_activity_callback: Callable[[int], Awaitable[None]] | None = None
+        self._assistant_leave_callback: Callable[[int], Awaitable[None]] | None = None
         self._register_stream_end_handler()
 
     def set_loop_all_enabled(self, chat_id: int, enabled: bool) -> None:
@@ -107,6 +109,12 @@ class VoiceService:
     ) -> None:
         self._auto_transition_callback = callback
 
+    def set_assistant_activity_callback(self, callback: Callable[[int], Awaitable[None]]) -> None:
+        self._assistant_activity_callback = callback
+
+    def set_assistant_leave_callback(self, callback: Callable[[int], Awaitable[None]]) -> None:
+        self._assistant_leave_callback = callback
+
     async def _notify_auto_transition(self, chat_id: int, track: Track | None) -> None:
         if self._auto_transition_callback is None:
             return
@@ -114,6 +122,22 @@ class VoiceService:
             await self._auto_transition_callback(chat_id, track)
         except Exception as exc:
             self.logger.warning("Auto transition UI callback failed in chat %s: %s", chat_id, exc)
+
+    async def _notify_assistant_activity(self, chat_id: int) -> None:
+        if self._assistant_activity_callback is None:
+            return
+        try:
+            await self._assistant_activity_callback(chat_id)
+        except Exception as exc:
+            self.logger.debug("Assistant activity callback failed in chat %s: %s", chat_id, exc)
+
+    async def _notify_assistant_leave(self, chat_id: int) -> None:
+        if self._assistant_leave_callback is None:
+            return
+        try:
+            await self._assistant_leave_callback(chat_id)
+        except Exception as exc:
+            self.logger.debug("Assistant leave callback failed in chat %s: %s", chat_id, exc)
 
     async def _safe_cleanup(self, track: Track | None) -> None:
         # Intentional no-op for now. Keep this hook for future cleanup,
@@ -214,7 +238,11 @@ class VoiceService:
                     return
 
                 try:
-                    await self.calls.leave_call(chat_id)
+                    if await self._is_connected(chat_id):
+                        try:
+                            await self.calls.leave_call(chat_id)
+                        except Exception:
+                            pass
                 except Exception:
                     pass
 
@@ -317,6 +345,7 @@ class VoiceService:
                 if not was_connected:
                     self.logger.info("VC reconnected in chat %s", chat_id)
                 self.logger.info("Stream started in chat %s", chat_id)
+                await self._notify_assistant_activity(chat_id)
                 await self._refresh_auto_leave_watch(chat_id)
                 return
             except Exception as exc:
@@ -374,10 +403,15 @@ class VoiceService:
         if not track:
             await self._reset_state(chat_id, "queue empty", keep_queue=True)
             try:
-                await self.calls.leave_call(chat_id)
+                if await self._is_connected(chat_id):
+                    try:
+                        await self.calls.leave_call(chat_id)
+                    except Exception:
+                        pass
             except Exception:
                 pass
-            self.logger.info("Queue empty; left call in chat %s", chat_id)
+            await self._notify_assistant_leave(chat_id)
+            self.logger.info("Queue empty → VC left → assistant leave scheduled in chat %s", chat_id)
             if notify_ui:
                 await self._notify_auto_transition(chat_id, None)
             return None
@@ -452,7 +486,11 @@ class VoiceService:
                     exc,
                 )
                 try:
-                    await self.calls.leave_call(chat_id)
+                    if await self._is_connected(chat_id):
+                        try:
+                            await self.calls.leave_call(chat_id)
+                        except Exception:
+                            pass
                 except Exception:
                     pass
                 await self._reset_state(chat_id, "force play fallback reconnect", keep_queue=True)
@@ -490,7 +528,11 @@ class VoiceService:
             await self.invalidate_prefetch(chat_id)
             current = await self.queue.get_current(chat_id)
             try:
-                await self.calls.leave_call(chat_id)
+                if await self._is_connected(chat_id):
+                    try:
+                        await self.calls.leave_call(chat_id)
+                    except Exception:
+                        pass
             except Exception:
                 pass
 
@@ -506,7 +548,11 @@ class VoiceService:
             queued = await self.queue.clear(chat_id)
 
             try:
-                await self.calls.leave_call(chat_id)
+                if await self._is_connected(chat_id):
+                    try:
+                        await self.calls.leave_call(chat_id)
+                    except Exception:
+                        pass
             except Exception:
                 pass
 
@@ -515,6 +561,7 @@ class VoiceService:
             await self._safe_cleanup(current)
 
             await self._reset_state(chat_id, "stop requested", keep_queue=False)
+            await self._notify_assistant_leave(chat_id)
 
     async def set_volume(self, chat_id: int, volume: int) -> int:
         value = await self.queue.set_volume(chat_id, volume)

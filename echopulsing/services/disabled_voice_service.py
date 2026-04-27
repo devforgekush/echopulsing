@@ -25,6 +25,12 @@ class DisabledVoiceService:
     async def invalidate_prefetch(self, chat_id: int) -> None:
         return
 
+    def set_assistant_activity_callback(self, callback) -> None:
+        return
+
+    def set_assistant_leave_callback(self, callback) -> None:
+        return
+
     async def pause(self, chat_id: int) -> None:
         raise self._error()
 

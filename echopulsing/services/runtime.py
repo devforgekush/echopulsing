@@ -84,7 +84,11 @@ class Runtime:
                     "Use Linux (Docker/WSL/VPS) for voice chat streaming."
                 )
 
-        self.assistant = AssistantService(self.bot, self.user, logger)
+        self.assistant = AssistantService(self.bot, self.user, self.queue, logger)
+        if hasattr(self.voice, "set_assistant_activity_callback"):
+            self.voice.set_assistant_activity_callback(self.assistant.mark_active)
+        if hasattr(self.voice, "set_assistant_leave_callback"):
+            self.voice.set_assistant_leave_callback(self.assistant.schedule_leave)
         self.playback = PlaybackService(self.voice, self.ytdlp, logger)
 
     async def _sync_ui_after_auto_transition(self, chat_id: int, track: Track | None) -> None:

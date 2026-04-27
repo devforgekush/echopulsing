@@ -8,6 +8,8 @@ from typing import Any
 
 from pyrogram import Client, enums
 
+from echopulsing.services.queue_manager import QueueManager
+
 
 @dataclass(slots=True)
 class PendingPlayRequest:
@@ -24,10 +26,12 @@ class AssistantService:
     _INVITE_LINK_TTL_SECONDS = 5 * 60
     _PENDING_REQUEST_TTL_SECONDS = 20 * 60
     _JOIN_COOLDOWN_SECONDS = 10
+    _INACTIVITY_LEAVE_DELAY_SECONDS = 40 * 60
 
-    def __init__(self, bot: Client, user: Client, logger: Any) -> None:
+    def __init__(self, bot: Client, user: Client, queue_manager: QueueManager, logger: Any) -> None:
         self._bot = bot
         self._user = user
+        self._queue = queue_manager
         self._logger = logger
         self._assistant_id: int | None = None
         self._assistant_username: str | None = None
@@ -37,6 +41,9 @@ class AssistantService:
         self._last_join_attempt: dict[int, float] = {}
         self._join_locks: dict[int, asyncio.Lock] = {}
         self._assistant_present: dict[int, bool] = {}
+        self._last_active: dict[int, float] = {}
+        self._leave_tasks: dict[int, asyncio.Task[None]] = {}
+        self._leave_delay = 2400  # 40 minutes
 
     async def initialize(self) -> None:
         if self._assistant_id is not None:
@@ -147,6 +154,53 @@ class AssistantService:
     def clear_pending_play(self, token: str) -> None:
         self._pending.pop(token, None)
 
+    def mark_active(self, chat_id: int) -> None:
+        self._last_active[chat_id] = time.monotonic()
+
+    async def schedule_leave(self, chat_id: int) -> None:
+        task = self._leave_tasks.get(chat_id)
+        if task and not task.done():
+            task.cancel()
+
+        self._leave_tasks[chat_id] = asyncio.create_task(self._leave_after_delay(chat_id))
+
+    async def _leave_after_delay(self, chat_id: int) -> None:
+        delay = self._leave_delay
+
+        try:
+            await asyncio.sleep(delay)
+
+            last = self._last_active.get(chat_id, 0.0)
+            if time.monotonic() - last < delay:
+                return
+
+            if await self._queue.get_current(chat_id) or await self._queue.peek_next(chat_id):
+                return
+
+            await self.initialize()
+            if self._assistant_id is None:
+                return
+
+            member = await self._bot.get_chat_member(chat_id, self._assistant_id)
+            if member.status in (enums.ChatMemberStatus.ADMINISTRATOR, enums.ChatMemberStatus.OWNER):
+                return
+
+            if not await self.is_in_chat(chat_id):
+                return
+
+            await self._user.leave_chat(chat_id)
+            self._logger.info(f"Assistant left inactive chat {chat_id}")
+            self._set_assistant_presence(chat_id, False)
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            self._logger.debug(f"Assistant leave failed in chat {chat_id}: {e}")
+            return
+        finally:
+            current_task = asyncio.current_task()
+            if self._leave_tasks.get(chat_id) is current_task:
+                self._leave_tasks.pop(chat_id, None)
+
     @staticmethod
     def _join_error_message(exc: Exception) -> str:
         text = str(exc).upper()
@@ -169,14 +223,17 @@ class AssistantService:
                 self._user.join_chat(invite_link),
                 timeout=10,
             )
-        except TimeoutError:
+        except asyncio.TimeoutError:
+            self._invite_cache.pop(chat_id, None)
             return False, "Assistant join timed out. Please try again."
         except Exception as exc:
+            self._invite_cache.pop(chat_id, None)
             text = str(exc).upper()
             if "USER_ALREADY_PARTICIPANT" not in text:
                 return False, self._join_error_message(exc)
 
         if await self.is_in_chat(chat_id):
+            self.mark_active(chat_id)
             return True, None
         return False, "Assistant is still not in this group."
 
@@ -220,6 +277,7 @@ class AssistantService:
             # Check if already in chat
             if await self.is_in_chat(chat_id):
                 self._set_assistant_presence(chat_id, True)
+                self.mark_active(chat_id)
                 return True, None
 
             self._set_assistant_presence(chat_id, False)
@@ -244,10 +302,11 @@ class AssistantService:
                 return False, error_msg
 
             # Verify join was successful
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(1.0)
 
             if await self.is_in_chat(chat_id):
                 self._set_assistant_presence(chat_id, True)
+                self.mark_active(chat_id)
                 return True, None
 
             self._set_assistant_presence(chat_id, False)

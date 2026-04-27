@@ -47,6 +47,10 @@ def _display_name(message: Message) -> str:
     return "Anonymous"
 
 
+def _mark_assistant_active(runtime: "Runtime", chat_id: int) -> None:
+    runtime.assistant.mark_active(chat_id)
+
+
 def _escape(text: str | None) -> str:
     return html.escape(text or "", quote=False)
 
@@ -540,6 +544,7 @@ def register(app: Client, runtime: Runtime) -> None:
             return
         try:
             await runtime.voice.resume(message.chat.id)
+            _mark_assistant_active(runtime, message.chat.id)
             await runtime.ui.refresh_now_playing(message.chat.id, force=True)
             await message.reply_text("Playback resumed.")
         except Exception as exc:
@@ -552,6 +557,7 @@ def register(app: Client, runtime: Runtime) -> None:
             return
         try:
             next_track = await runtime.voice.skip(message.chat.id)
+            _mark_assistant_active(runtime, message.chat.id)
             if next_track:
                 await runtime.ui.show_now_playing(message.chat.id, next_track)
                 await message.reply_text(f"Skipped. Now playing: {next_track.title}")
@@ -749,12 +755,15 @@ def register(app: Client, runtime: Runtime) -> None:
                 if not await _require_admin_query(client, query):
                     return
                 paused = await runtime.voice.toggle_pause(chat_id)
+                if not paused:
+                    _mark_assistant_active(runtime, chat_id)
                 await runtime.ui.refresh_now_playing(chat_id, force=True)
                 await _safe_answer_query(query, "Paused" if paused else "Playing")
             elif action == "skip":
                 if not await _require_admin_query(client, query):
                     return
                 next_track = await runtime.voice.skip(chat_id)
+                _mark_assistant_active(runtime, chat_id)
                 if next_track:
                     await runtime.ui.show_now_playing(chat_id, next_track)
                     await _safe_answer_query(query, "Skipped")
@@ -774,6 +783,7 @@ def register(app: Client, runtime: Runtime) -> None:
                 if not await _require_admin_query(client, query):
                     return
                 count = await runtime.queue.shuffle(chat_id)
+                _mark_assistant_active(runtime, chat_id)
                 await runtime.log_event(f"Queue reorder (shuffle) in {chat_id}: {count} track(s)")
                 await runtime.voice.invalidate_prefetch(chat_id)
                 await runtime.ui.refresh_now_playing(chat_id, force=True)
