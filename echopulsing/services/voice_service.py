@@ -130,16 +130,24 @@ class VoiceService:
         return await self._group_call_is_active(chat_id)
 
     async def _participant_count(self, chat_id: int) -> int | None:
-        try:
-            if hasattr(self.calls, "get_participants"):
-                participants = await self.calls.get_participants(chat_id)
-                return len(list(participants))
-            if hasattr(self.calls, "get_group_call_participants"):
-                participants = await self.calls.get_group_call_participants(chat_id)
-                return len(list(participants))
-        except Exception as exc:
-            self.logger.debug("Could not fetch VC participants in chat %s: %s", chat_id, exc)
-            return None
+        for attempt in range(2):
+            try:
+                if hasattr(self.calls, "get_participants"):
+                    participants = await self.calls.get_participants(chat_id)
+                    return len(list(participants))
+                if hasattr(self.calls, "get_group_call_participants"):
+                    participants = await self.calls.get_group_call_participants(chat_id)
+                    return len(list(participants))
+            except Exception as exc:
+                self.logger.debug(
+                    "Could not fetch VC participants in chat %s (attempt %s): %s",
+                    chat_id,
+                    attempt + 1,
+                    exc,
+                )
+                if attempt == 0:
+                    continue
+                return None
         return None
 
     async def _is_only_bot_in_vc(self, chat_id: int) -> bool:
@@ -150,24 +158,27 @@ class VoiceService:
             return False
         return participant_count <= 1
 
-    def _cancel_auto_leave_timer(self, chat_id: int) -> None:
+    def _cancel_auto_leave_timer(self, chat_id: int, reason: str = "") -> None:
         task = self._auto_leave_tasks.pop(chat_id, None)
         if task and not task.done():
             task.cancel()
+            if reason:
+                self.logger.info("Auto-leave timer canceled in chat %s: %s", chat_id, reason)
 
     async def _refresh_auto_leave_watch(self, chat_id: int) -> None:
         if not await self._is_connected(chat_id):
-            self._cancel_auto_leave_timer(chat_id)
+            self._cancel_auto_leave_timer(chat_id, "voice chat disconnected")
             return
 
         if not await self._is_only_bot_in_vc(chat_id):
-            self._cancel_auto_leave_timer(chat_id)
+            self._cancel_auto_leave_timer(chat_id, "participants detected")
             return
 
         task = self._auto_leave_tasks.get(chat_id)
         if task and not task.done():
             return
 
+        self.logger.info("Auto-leave timer started in chat %s (delay=%ss)", chat_id, self._AUTO_LEAVE_DELAY_SECONDS)
         self._auto_leave_tasks[chat_id] = asyncio.create_task(self._auto_leave_when_empty(chat_id))
 
     async def _auto_leave_when_empty(self, chat_id: int) -> None:
@@ -210,7 +221,7 @@ class VoiceService:
                 self._auto_leave_tasks.pop(chat_id, None)
 
     async def _reset_state(self, chat_id: int, reason: str, keep_queue: bool = True) -> None:
-        self._cancel_auto_leave_timer(chat_id)
+        self._cancel_auto_leave_timer(chat_id, f"state reset: {reason}")
         self._active_chats.discard(chat_id)
         self._started_at.pop(chat_id, None)
         self._paused_at.pop(chat_id, None)

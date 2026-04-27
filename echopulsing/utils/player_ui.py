@@ -143,7 +143,14 @@ class PlayerUI:
         except Exception:
             pass
 
+    def _cancel_progress_task(self, chat_id: int) -> None:
+        task = self._progress_tasks.pop(chat_id, None)
+        current_task = asyncio.current_task()
+        if task and not task.done() and task is not current_task:
+            task.cancel()
+
     async def show_now_playing(self, chat_id: int, track: Track) -> None:
+        self._cancel_progress_task(chat_id)
         async with self._locks[chat_id]:
             await self._delete_previous(chat_id)
             body = await self._build_body(chat_id, track)
@@ -195,6 +202,7 @@ class PlayerUI:
         ref = self._last_now_playing.get(chat_id)
         signature = self._track_signature(current)
         if not ref or signature != ref.track_signature:
+            self._cancel_progress_task(chat_id)
             await self.show_now_playing(chat_id, current)
             return
 
@@ -239,10 +247,7 @@ class PlayerUI:
             await self.show_now_playing(chat_id, current)
 
     async def clear_now_playing(self, chat_id: int) -> None:
-        task = self._progress_tasks.pop(chat_id, None)
-        current_task = asyncio.current_task()
-        if task and not task.done() and task is not current_task:
-            task.cancel()
+        self._cancel_progress_task(chat_id)
 
         async with self._locks[chat_id]:
             ref = self._last_now_playing.pop(chat_id, None)

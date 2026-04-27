@@ -236,7 +236,11 @@ async def _require_admin(client: Client, message: Message) -> bool:
     if not message.from_user:
         await message.reply_text("Only real user accounts can run this command.")
         return False
-    if await is_admin(client, message.chat.id, message.from_user.id):
+    try:
+        is_chat_admin = await is_admin(client, message.chat.id, message.from_user.id)
+    except Exception:
+        is_chat_admin = False
+    if is_chat_admin:
         return True
     await message.reply_text("Only group admins can use this control command.")
     return False
@@ -246,7 +250,11 @@ async def _require_admin_query(client: Client, query: CallbackQuery) -> bool:
     if not query.message or not query.from_user:
         await _safe_answer_query(query, "Only real user accounts can use this control.", show_alert=True)
         return False
-    if await is_admin(client, query.message.chat.id, query.from_user.id):
+    try:
+        is_chat_admin = await is_admin(client, query.message.chat.id, query.from_user.id)
+    except Exception:
+        is_chat_admin = False
+    if is_chat_admin:
         return True
     await _safe_answer_query(query, "Only group admins can use this control command.", show_alert=True)
     return False
@@ -425,64 +433,71 @@ def register(app: Client, runtime: Runtime) -> None:
 
     @app.on_callback_query(filters.regex(r"^assistant_retry:"))
     async def assistant_retry_handler(client: Client, query: CallbackQuery) -> None:
-        if not query.message or not query.from_user:
-            await _safe_answer_query(query, "Play request not found.", show_alert=True)
-            return
+        try:
+            if not query.message or not query.from_user:
+                await _safe_answer_query(query, "Play request not found.", show_alert=True)
+                return
 
-        token = (query.data or "").split(":", maxsplit=1)[-1]
-        pending = runtime.assistant.get_pending_play(token)
-        if not pending:
-            await _safe_answer_query(query, "Retry request expired. Run /play again.", show_alert=True)
-            return
+            token = (query.data or "").split(":", maxsplit=1)[-1]
+            pending = runtime.assistant.get_pending_play(token)
+            if not pending:
+                await _safe_answer_query(query, "Retry request expired. Run /play again.", show_alert=True)
+                return
 
-        if pending.chat_id != query.message.chat.id:
-            await _safe_answer_query(query, "This retry button belongs to another chat.", show_alert=True)
-            return
+            if pending.chat_id != query.message.chat.id:
+                await _safe_answer_query(query, "This retry button belongs to another chat.", show_alert=True)
+                return
 
-        is_owner = query.from_user.id == pending.requester_id
-        is_chat_admin = await is_admin(client, pending.chat_id, query.from_user.id)
-        if not is_owner and not is_chat_admin:
-            await _safe_answer_query(query, "Only requester or admins can retry.", show_alert=True)
-            return
+            is_owner = query.from_user.id == pending.requester_id
+            try:
+                is_chat_admin = await is_admin(client, pending.chat_id, query.from_user.id)
+            except Exception:
+                is_chat_admin = False
+            if not is_owner and not is_chat_admin:
+                await _safe_answer_query(query, "Only requester or admins can retry.", show_alert=True)
+                return
 
-        await _safe_answer_query(query, "Checking assistant...")
+            await _safe_answer_query(query, "Checking assistant...")
 
-        join_error: str | None = None
-        if not await runtime.assistant.is_in_chat(pending.chat_id):
-            if pending.invite_link:
-                _, join_error = await runtime.assistant.try_join_with_invite(
-                    pending.chat_id,
-                    pending.invite_link,
+            join_error: str | None = None
+            if not await runtime.assistant.is_in_chat(pending.chat_id):
+                if pending.invite_link:
+                    _, join_error = await runtime.assistant.try_join_with_invite(
+                        pending.chat_id,
+                        pending.invite_link,
+                    )
+                else:
+                    join_error = "No invite link available for auto-join in this group."
+
+            if not await runtime.assistant.is_in_chat(pending.chat_id):
+                invite_link, invite_error = await runtime.assistant.get_invite_link(pending.chat_id)
+                refreshed = runtime.assistant.create_pending_play(
+                    chat_id=pending.chat_id,
+                    requester_id=pending.requester_id,
+                    requester_name=pending.requester_name,
+                    query=pending.query,
+                    invite_link=invite_link,
                 )
-            else:
-                join_error = "No invite link available for auto-join in this group."
+                reason = join_error or invite_error
+                await query.message.edit_text(
+                    _assistant_missing_text(runtime.assistant.assistant_label, reason),
+                    reply_markup=_assistant_keyboard(invite_link, refreshed.token),
+                )
+                runtime.assistant.clear_pending_play(token)
+                return
 
-        if not await runtime.assistant.is_in_chat(pending.chat_id):
-            invite_link, invite_error = await runtime.assistant.get_invite_link(pending.chat_id)
-            refreshed = runtime.assistant.create_pending_play(
-                chat_id=pending.chat_id,
+            runtime.assistant.clear_pending_play(token)
+            await query.message.edit_text("✅ Assistant joined. Retrying playback...")
+            await _execute_playback(
+                runtime,
+                query.message,
+                query=pending.query,
                 requester_id=pending.requester_id,
                 requester_name=pending.requester_name,
-                query=pending.query,
-                invite_link=invite_link,
             )
-            reason = join_error or invite_error
-            await query.message.edit_text(
-                _assistant_missing_text(runtime.assistant.assistant_label, reason),
-                reply_markup=_assistant_keyboard(invite_link, refreshed.token),
-            )
-            runtime.assistant.clear_pending_play(token)
-            return
-
-        runtime.assistant.clear_pending_play(token)
-        await query.message.edit_text("✅ Assistant joined. Retrying playback...")
-        await _execute_playback(
-            runtime,
-            query.message,
-            query=pending.query,
-            requester_id=pending.requester_id,
-            requester_name=pending.requester_name,
-        )
+        except Exception as exc:
+            await runtime.log_event(f"assistant retry failed in chat {query.message.chat.id if query.message else 0}: {exc}")
+            await _safe_answer_query(query, "Action failed", show_alert=True)
 
     @app.on_message(filters.command(["pause", "hold"]) & filters.group)
     async def pause_handler(client: Client, message: Message) -> None:
@@ -666,11 +681,14 @@ def register(app: Client, runtime: Runtime) -> None:
                     None,
                 )
                 if selected is None:
-                    await _safe_answer_query(query, "Track is no longer queued.", show_alert=True)
+                    await _safe_answer_query(query, "❌ Track no longer in queue", show_alert=True)
                     return
 
                 is_owner = query.from_user.id == selected.requester_id
-                is_chat_admin = await is_admin(client, chat_id, query.from_user.id)
+                try:
+                    is_chat_admin = await is_admin(client, chat_id, query.from_user.id)
+                except Exception:
+                    is_chat_admin = False
                 if not is_owner and not is_chat_admin:
                     await _safe_answer_query(query, "Only requester or admins can use this button.", show_alert=True)
                     return
@@ -680,8 +698,18 @@ def register(app: Client, runtime: Runtime) -> None:
                     lambda track: _track_force_signature(track) == token or (track.id and track.id == token),
                 )
                 if target is None:
-                    await _safe_answer_query(query, "Track is no longer queued.", show_alert=True)
+                    await _safe_answer_query(query, "❌ Track no longer in queue", show_alert=True)
                     return
+
+                await runtime.log_event(f"Force play requested in {chat_id} by {query.from_user.id}")
+                try:
+                    await query.message.edit_reply_markup(
+                        InlineKeyboardMarkup(
+                            [[InlineKeyboardButton("▶️ Playing...", callback_data="player:noop")]]
+                        )
+                    )
+                except Exception:
+                    pass
 
                 started = await runtime.voice.force_play(chat_id, target)
                 if started is None:
@@ -717,12 +745,15 @@ def register(app: Client, runtime: Runtime) -> None:
                 if not await _require_admin_query(client, query):
                     return
                 count = await runtime.queue.shuffle(chat_id)
+                await runtime.log_event(f"Queue reorder (shuffle) in {chat_id}: {count} track(s)")
                 await runtime.voice.invalidate_prefetch(chat_id)
                 await runtime.ui.refresh_now_playing(chat_id, force=True)
                 if count:
                     await _safe_answer_query(query, f"Shuffled {count} queued tracks")
                 else:
                     await _safe_answer_query(query, "Queue is empty")
+            elif action == "noop":
+                await _safe_answer_query(query, "Already processing")
             elif action == "stop":
                 if not await _require_admin_query(client, query):
                     return

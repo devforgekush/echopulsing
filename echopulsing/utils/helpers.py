@@ -83,7 +83,7 @@ def get_system_usage_percent() -> tuple[str, str]:
     try:
         import psutil  # type: ignore
 
-        cpu = max(0.0, min(100.0, float(psutil.cpu_percent(interval=0.1))))
+        cpu = max(0.0, min(100.0, float(psutil.cpu_percent(interval=0.5))))
         ram = max(0.0, min(100.0, float(psutil.virtual_memory().percent)))
         return f"{cpu:.0f}%", f"{ram:.0f}%"
     except Exception:
