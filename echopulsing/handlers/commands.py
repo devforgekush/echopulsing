@@ -180,7 +180,7 @@ async def _execute_force_playback(
         track = await runtime.ytdlp.resolve(query, requester_id, requester_name)
         started = await runtime.voice.force_play(message.chat.id, track)
         if started is not None:
-            await runtime.ui.show_force_playing(message.chat.id, started)
+            await runtime.ui.show_now_playing(message.chat.id, started, mode="force")
             return
         await message.reply_text("❌ Failed to start forced playback")
     except ValueError as exc:
@@ -201,6 +201,39 @@ async def _execute_force_playback(
                 await status_message.delete()
             except Exception:
                 pass
+
+
+async def _ensure_assistant_with_fallback(
+    runtime: Runtime,
+    message: Message,
+    *,
+    query: str,
+    requester_id: int,
+    requester_name: str,
+) -> bool:
+    """
+    Attempt automatic assistant join with fallback to manual prompt.
+    
+    Returns:
+        True if assistant is now in chat and playback can proceed
+        False if assistant is not in chat (user should see manual prompt)
+    """
+    # First, try automatic join
+    success, error_msg = await runtime.assistant.ensure_assistant_joins(message.chat.id)
+    
+    if success:
+        return True
+    
+    # If auto-join failed, show manual prompt with the error reason
+    await _prompt_assistant_join(
+        runtime,
+        message,
+        query=query,
+        requester_id=requester_id,
+        requester_name=requester_name,
+        extra_error=error_msg,
+    )
+    return False
 
 
 async def _prompt_assistant_join(
@@ -374,14 +407,15 @@ def register(app: Client, runtime: Runtime) -> None:
 
         requester_id = message.from_user.id if message.from_user else 0
         requester_name = _display_name(message)
-        if not await runtime.assistant.is_in_chat(message.chat.id):
-            await _prompt_assistant_join(
-                runtime,
-                message,
-                query=query,
-                requester_id=requester_id,
-                requester_name=requester_name,
-            )
+        
+        # Auto-join assistant with fallback to manual prompt
+        if not await _ensure_assistant_with_fallback(
+            runtime,
+            message,
+            query=query,
+            requester_id=requester_id,
+            requester_name=requester_name,
+        ):
             return
 
         await _execute_playback(
@@ -407,15 +441,15 @@ def register(app: Client, runtime: Runtime) -> None:
 
         requester_id = message.from_user.id if message.from_user else 0
         requester_name = _display_name(message)
-        if not await runtime.assistant.is_in_chat(message.chat.id):
-            await _prompt_assistant_join(
-                runtime,
-                message,
-                query=query,
-                requester_id=requester_id,
-                requester_name=requester_name,
-                extra_error="Assistant must join before /playforce can start audio.",
-            )
+        
+        # Auto-join assistant with fallback to manual prompt
+        if not await _ensure_assistant_with_fallback(
+            runtime,
+            message,
+            query=query,
+            requester_id=requester_id,
+            requester_name=requester_name,
+        ):
             return
 
         await _execute_force_playback(
@@ -454,17 +488,11 @@ def register(app: Client, runtime: Runtime) -> None:
 
             await _safe_answer_query(query, "Checking assistant...")
 
-            join_error: str | None = None
-            if not await runtime.assistant.is_in_chat(pending.chat_id):
-                if pending.invite_link:
-                    _, join_error = await runtime.assistant.try_join_with_invite(
-                        pending.chat_id,
-                        pending.invite_link,
-                    )
-                else:
-                    join_error = "No invite link available for auto-join in this group."
+            # Try auto-join again
+            success, error_msg = await runtime.assistant.ensure_assistant_joins(pending.chat_id)
 
-            if not await runtime.assistant.is_in_chat(pending.chat_id):
+            if not success:
+                # Auto-join failed, show updated prompt with error
                 invite_link, invite_error = await runtime.assistant.get_invite_link(pending.chat_id)
                 refreshed = runtime.assistant.create_pending_play(
                     chat_id=pending.chat_id,
@@ -473,7 +501,7 @@ def register(app: Client, runtime: Runtime) -> None:
                     query=pending.query,
                     invite_link=invite_link,
                 )
-                reason = join_error or invite_error
+                reason = error_msg or invite_error
                 await query.message.edit_text(
                     _assistant_missing_text(runtime.assistant.assistant_label, reason),
                     reply_markup=_assistant_keyboard(invite_link, refreshed.token),

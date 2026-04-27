@@ -389,9 +389,15 @@ class VoiceService:
                 raise RuntimeError("Could not resolve a direct stream URL for playback")
             await self._start_stream(chat_id, track)
         except Exception:
-            if loop_mode != "single":
-                await self.queue.enqueue_front(chat_id, track)
-            raise
+            try:
+                track = await self.ytdlp.ensure_stream_url(track)
+                if not track.stream_url:
+                    raise RuntimeError("Could not resolve a direct stream URL for playback")
+                await self._start_stream(chat_id, track)
+            except Exception:
+                if loop_mode != "single":
+                    await self.queue.enqueue_front(chat_id, track)
+                raise
 
         await self.queue.set_current(chat_id, track)
         self.logger.info("Now playing in chat %s: %s", chat_id, track.title)

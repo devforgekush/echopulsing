@@ -19,7 +19,7 @@ class _NowPlayingRef:
     last_body: str
     last_controls_signature: str
     track_signature: str
-    body_style: str
+    mode: str
 
 
 class PlayerUI:
@@ -103,6 +103,7 @@ class PlayerUI:
     async def loading_animation(self, message: Message) -> Message | None:
         sequence = [
             "⚡ Initializing stream...",
+            "🤖 Ensuring assistant is connected...",
             "🔄 Connecting to voice chat...",
             "🎶 Fetching track...",
             "▶️ Starting playback...",
@@ -119,32 +120,52 @@ class PlayerUI:
                 break
         return status
 
-    async def _build_body(self, chat_id: int, track: Track, body_style: str = "now") -> str:
+    async def _get_assistant_status(self, chat_id: int) -> str:
+        """Get assistant status display."""
+        try:
+            in_chat = await self.runtime.assistant.is_in_chat(chat_id)
+            if in_chat:
+                label = self.runtime.assistant.assistant_label
+                return f"🤖 <b>Assistant:</b> <code>Connected ({label})</code>"
+            else:
+                return "🤖 <b>Assistant:</b> <code>Joining...</code>"
+        except Exception:
+            return ""
+
+    async def _build_body(self, chat_id: int, track: Track, mode: str = "normal") -> str:
         duration = track.duration
 
-        if body_style == "force":
+        if mode == "force":
             title = _escape_html(self._trim_text(track.title, 60))
             requester_name = _escape_html(self._trim_text(track.requester_name, 40))
             duration_text = _escape_html(format_seconds(duration))
-            return (
+            assistant_status = await self._get_assistant_status(chat_id)
+            body = (
                 "<b>🎵 Force Playing</b>\n\n"
                 f"<b>▶️ Title:</b> <code>{title}</code>\n"
                 f"<b>⏱ Duration:</b> <code>{duration_text}</code>\n"
                 f"<b>👤 Requested by:</b> <code>{requester_name}</code>"
             )
+            if assistant_status:
+                body += f"\n\n{assistant_status}"
+            return body
 
         elapsed = await self.runtime.voice.get_elapsed(chat_id)
         title = _escape_html(self._trim_text(track.title, 70))
         requester_name = _escape_html(self._trim_text(track.requester_name, 40))
         progress = _escape_html(self._progress_line(elapsed, duration))
+        assistant_status = await self._get_assistant_status(chat_id)
 
-        return (
+        body = (
             "🎵 <b>Now Playing</b>\n\n"
             f"▶️ <b>Title:</b> <code>{title}</code>\n"
             f"👤 <b>Requested by:</b> <code>{requester_name}</code>\n\n"
             "⏳ <b>Progress:</b>\n"
             f"<code>{progress}</code>"
         )
+        if assistant_status:
+            body += f"\n\n{assistant_status}"
+        return body
 
     async def _delete_previous(self, chat_id: int) -> None:
         previous = self._last_now_playing.get(chat_id)
@@ -156,26 +177,23 @@ class PlayerUI:
             pass
 
     def _cancel_progress_task(self, chat_id: int) -> None:
-        task = self._progress_tasks.pop(chat_id, None)
+        task = self._progress_tasks.get(chat_id)
         current_task = asyncio.current_task()
         if task and not task.done() and task is not current_task:
             task.cancel()
+        self._progress_tasks.pop(chat_id, None)
 
-    async def show_now_playing(self, chat_id: int, track: Track) -> None:
-        await self._show_track_message(chat_id, track, body_style="now")
+    async def show_now_playing(self, chat_id: int, track: Track, mode: str = "normal") -> None:
+        await self._show_track_message(chat_id, track, mode=mode)
 
-    async def show_force_playing(self, chat_id: int, track: Track) -> None:
-        await self._show_track_message(chat_id, track, body_style="force")
-
-    async def _show_track_message(self, chat_id: int, track: Track, body_style: str) -> None:
+    async def _show_track_message(self, chat_id: int, track: Track, mode: str) -> None:
         self._cancel_progress_task(chat_id)
         async with self._locks[chat_id]:
             await self._delete_previous(chat_id)
-            body = await self._build_body(chat_id, track, body_style=body_style)
+            body = await self._build_body(chat_id, track, mode=mode)
             markup, controls_signature = await self._controls_state(chat_id)
             sent: Message
             is_photo = False
-
             if track.thumbnail:
                 try:
                     sent = await self.bot.send_photo(
@@ -207,7 +225,7 @@ class PlayerUI:
                 last_body=body,
                 last_controls_signature=controls_signature,
                 track_signature=self._track_signature(track),
-                body_style=body_style,
+                mode=mode,
             )
 
         self._ensure_progress_task(chat_id)
@@ -219,14 +237,14 @@ class PlayerUI:
             return
 
         ref = self._last_now_playing.get(chat_id)
+        mode = ref.mode if ref else "normal"
         signature = self._track_signature(current)
         if not ref or signature != ref.track_signature:
             self._cancel_progress_task(chat_id)
-            await self.show_now_playing(chat_id, current)
+            await self.show_now_playing(chat_id, current, mode=mode)
             return
 
-        body_style = ref.body_style if ref else "now"
-        body = await self._build_body(chat_id, current, body_style=body_style)
+        body = await self._build_body(chat_id, current, mode=mode)
         markup, controls_signature = await self._controls_state(chat_id)
         if body == ref.last_body and controls_signature == ref.last_controls_signature:
             return
@@ -264,7 +282,7 @@ class PlayerUI:
                     self._last_now_playing.pop(chat_id, None)
 
         if resend_required:
-            await self.show_now_playing(chat_id, current)
+            await self.show_now_playing(chat_id, current, mode=mode)
 
     async def clear_now_playing(self, chat_id: int) -> None:
         self._cancel_progress_task(chat_id)
@@ -282,6 +300,7 @@ class PlayerUI:
         task = self._progress_tasks.get(chat_id)
         if task and not task.done():
             return
+        self._progress_tasks.pop(chat_id, None)
         self._progress_tasks[chat_id] = asyncio.create_task(self._progress_loop(chat_id))
 
     async def _progress_loop(self, chat_id: int) -> None:
@@ -297,6 +316,8 @@ class PlayerUI:
             return
         except Exception:
             return
+        finally:
+            self._progress_tasks.pop(chat_id, None)
 
 
 def _escape_html(text: str | None) -> str:
