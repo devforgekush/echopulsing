@@ -16,6 +16,7 @@ from echopulsing.services.ytdlp_service import YtDlpService
 class VoiceService:
     _AUTO_LEAVE_DELAY_SECONDS = 60
     _AUTO_LEAVE_CHECK_INTERVAL_SECONDS = 5
+    _MAX_LOOP_ALL_QUEUE_SIZE = 500
 
     def __init__(
         self,
@@ -36,8 +37,13 @@ class VoiceService:
         self._prefetch_cache: dict[int, Track] = {}
         self._prefetch_tasks: dict[int, asyncio.Task[None]] = {}
         self._auto_leave_tasks: dict[int, asyncio.Task[None]] = {}
+        self._loop_all_enabled: dict[int, bool] = {}
         self._auto_transition_callback: Callable[[int, Track | None], Awaitable[None]] | None = None
         self._register_stream_end_handler()
+
+    def set_loop_all_enabled(self, chat_id: int, enabled: bool) -> None:
+        self._loop_all_enabled[chat_id] = bool(enabled)
+        self.logger.info("[LoopAllFlag] chat=%s enabled=%s", chat_id, self._loop_all_enabled[chat_id])
 
     @staticmethod
     def _track_signature(track: Track | None) -> str:
@@ -110,6 +116,8 @@ class VoiceService:
             self.logger.warning("Auto transition UI callback failed in chat %s: %s", chat_id, exc)
 
     async def _safe_cleanup(self, track: Track | None) -> None:
+        # Intentional no-op for now. Keep this hook for future cleanup,
+        # e.g. deleting temp files or releasing per-track resources.
         return
 
     def _chat_lock(self, chat_id: int) -> asyncio.Lock:
@@ -336,12 +344,24 @@ class VoiceService:
     ) -> Track | None:
         previous = await self.queue.get_current(chat_id)
         loop_mode = await self.queue.get_loop_mode(chat_id)
+        if loop_mode not in ("off", "single", "all"):
+            loop_mode = "off"
+        self.logger.info(f"[LoopMode] chat={chat_id} mode={loop_mode}")
 
         if previous and loop_mode == "single" and not force_advance:
             track = previous
         else:
-            if previous and loop_mode == "all":
-                await self.queue.enqueue(chat_id, previous)
+            if previous and loop_mode == "all" and self._loop_all_enabled.get(chat_id, False):
+                queued_tracks = await self.queue.list_queue(chat_id)
+                if len(queued_tracks) <= self._MAX_LOOP_ALL_QUEUE_SIZE:
+                    await self.queue.enqueue(chat_id, previous)
+                else:
+                    self.logger.warning(
+                        "Skipping loop-all requeue in chat %s because queue length %s exceeds safety cap %s",
+                        chat_id,
+                        len(queued_tracks),
+                        self._MAX_LOOP_ALL_QUEUE_SIZE,
+                    )
             if previous and loop_mode != "single":
                 await self._safe_cleanup(previous)
             track = await self.queue.pop_next(chat_id)
@@ -402,6 +422,7 @@ class VoiceService:
             if is_playing and connected:
                 return "queued", position
 
+            self.set_loop_all_enabled(chat_id, False)
             started = await self._play_next_locked(chat_id)
             if started:
                 self.logger.info("Playback restarted in chat %s", chat_id)
@@ -410,22 +431,26 @@ class VoiceService:
 
     async def force_play(self, chat_id: int, new_track: Track) -> Track | None:
         async with self._chat_lock(chat_id):
-            current = await self.queue.get_current(chat_id)
-
+            self.set_loop_all_enabled(chat_id, False)
             await self.invalidate_prefetch(chat_id)
+            await self.queue.set_current(chat_id, None)
 
-            if current is not None:
-                await self.queue.enqueue_front(chat_id, current)
-
-            try:
-                await self.calls.leave_call(chat_id)
-            except Exception:
-                pass
-
-            await self._reset_state(chat_id, "force play", keep_queue=True)
             await self.queue.enqueue_front(chat_id, new_track)
 
-            started = await self._play_next_locked(chat_id)
+            try:
+                started = await self._play_next_locked(chat_id, force_advance=True)
+            except Exception as exc:
+                self.logger.warning(
+                    "Force-play in-place switch failed in chat %s; retrying with reconnect: %s",
+                    chat_id,
+                    exc,
+                )
+                try:
+                    await self.calls.leave_call(chat_id)
+                except Exception:
+                    pass
+                await self._reset_state(chat_id, "force play fallback reconnect", keep_queue=True)
+                started = await self._play_next_locked(chat_id, force_advance=True)
             if started is not None:
                 self._schedule_prefetch(chat_id)
             return started
@@ -455,6 +480,7 @@ class VoiceService:
 
     async def skip(self, chat_id: int) -> Track | None:
         async with self._chat_lock(chat_id):
+            self.set_loop_all_enabled(chat_id, False)
             await self.invalidate_prefetch(chat_id)
             current = await self.queue.get_current(chat_id)
             try:
@@ -468,6 +494,7 @@ class VoiceService:
 
     async def stop(self, chat_id: int) -> None:
         async with self._chat_lock(chat_id):
+            self.set_loop_all_enabled(chat_id, False)
             await self.invalidate_prefetch(chat_id)
             current = await self.queue.get_current(chat_id)
             queued = await self.queue.clear(chat_id)

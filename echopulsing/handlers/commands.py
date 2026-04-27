@@ -624,6 +624,9 @@ def register(app: Client, runtime: Runtime) -> None:
             return
 
         mode = await runtime.queue.set_loop_mode(message.chat.id, normalized)
+        set_loop_flag = getattr(runtime.voice, "set_loop_all_enabled", None)
+        if callable(set_loop_flag):
+            set_loop_flag(message.chat.id, mode == "all")
         await runtime.ui.refresh_now_playing(message.chat.id, force=True)
         await message.reply_text(f"Loop mode is now {mode}.")
 
@@ -739,6 +742,9 @@ def register(app: Client, runtime: Runtime) -> None:
                 if not await _require_admin_query(client, query):
                     return
                 mode = await runtime.queue.cycle_loop_mode(chat_id)
+                set_loop_flag = getattr(runtime.voice, "set_loop_all_enabled", None)
+                if callable(set_loop_flag):
+                    set_loop_flag(chat_id, mode == "all")
                 await runtime.ui.refresh_now_playing(chat_id, force=True)
                 await _safe_answer_query(query, f"Loop mode: {mode}")
             elif action == "shuffle":

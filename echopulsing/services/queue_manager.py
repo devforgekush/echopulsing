@@ -74,7 +74,12 @@ class QueueManager:
 
     async def get_loop_mode(self, chat_id: int) -> str:
         async with self._locks[chat_id]:
-            return self._state(chat_id).loop_mode
+            state = self._state(chat_id)
+            mode = state.loop_mode
+            if mode not in self._LOOP_MODES:
+                mode = "off"
+                state.loop_mode = mode
+            return mode
 
     async def cycle_loop_mode(self, chat_id: int) -> str:
         async with self._locks[chat_id]:
