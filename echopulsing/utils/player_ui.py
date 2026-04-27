@@ -19,6 +19,7 @@ class _NowPlayingRef:
     last_body: str
     last_controls_signature: str
     track_signature: str
+    body_style: str
 
 
 class PlayerUI:
@@ -118,10 +119,21 @@ class PlayerUI:
                 break
         return status
 
-    async def _build_body(self, chat_id: int, track: Track) -> str:
-        elapsed = await self.runtime.voice.get_elapsed(chat_id)
+    async def _build_body(self, chat_id: int, track: Track, body_style: str = "now") -> str:
         duration = track.duration
 
+        if body_style == "force":
+            title = _escape_html(self._trim_text(track.title, 60))
+            requester_name = _escape_html(self._trim_text(track.requester_name, 40))
+            duration_text = _escape_html(format_seconds(duration))
+            return (
+                "<b>🎵 Force Playing</b>\n\n"
+                f"<b>▶️ Title:</b> <code>{title}</code>\n"
+                f"<b>⏱ Duration:</b> <code>{duration_text}</code>\n"
+                f"<b>👤 Requested by:</b> <code>{requester_name}</code>"
+            )
+
+        elapsed = await self.runtime.voice.get_elapsed(chat_id)
         title = _escape_html(self._trim_text(track.title, 70))
         requester_name = _escape_html(self._trim_text(track.requester_name, 40))
         progress = _escape_html(self._progress_line(elapsed, duration))
@@ -150,10 +162,16 @@ class PlayerUI:
             task.cancel()
 
     async def show_now_playing(self, chat_id: int, track: Track) -> None:
+        await self._show_track_message(chat_id, track, body_style="now")
+
+    async def show_force_playing(self, chat_id: int, track: Track) -> None:
+        await self._show_track_message(chat_id, track, body_style="force")
+
+    async def _show_track_message(self, chat_id: int, track: Track, body_style: str) -> None:
         self._cancel_progress_task(chat_id)
         async with self._locks[chat_id]:
             await self._delete_previous(chat_id)
-            body = await self._build_body(chat_id, track)
+            body = await self._build_body(chat_id, track, body_style=body_style)
             markup, controls_signature = await self._controls_state(chat_id)
             sent: Message
             is_photo = False
@@ -189,6 +207,7 @@ class PlayerUI:
                 last_body=body,
                 last_controls_signature=controls_signature,
                 track_signature=self._track_signature(track),
+                body_style=body_style,
             )
 
         self._ensure_progress_task(chat_id)
@@ -206,7 +225,8 @@ class PlayerUI:
             await self.show_now_playing(chat_id, current)
             return
 
-        body = await self._build_body(chat_id, current)
+        body_style = ref.body_style if ref else "now"
+        body = await self._build_body(chat_id, current, body_style=body_style)
         markup, controls_signature = await self._controls_state(chat_id)
         if body == ref.last_body and controls_signature == ref.last_controls_signature:
             return

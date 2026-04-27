@@ -180,12 +180,7 @@ async def _execute_force_playback(
         track = await runtime.ytdlp.resolve(query, requester_id, requester_name)
         started = await runtime.voice.force_play(message.chat.id, track)
         if started is not None:
-            await runtime.ui.show_now_playing(message.chat.id, started)
-            await runtime.ui.refresh_now_playing(message.chat.id, force=True)
-            await message.reply_text(
-                f"⏩ Force playing: {_escape(started.title)}",
-                parse_mode=enums.ParseMode.HTML,
-            )
+            await runtime.ui.show_force_playing(message.chat.id, started)
             return
         await message.reply_text("❌ Failed to start forced playback")
     except ValueError as exc:
